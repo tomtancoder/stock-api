@@ -14,6 +14,17 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_root_points_to_docs_and_health():
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "name": "Stock Valuation API",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 def test_valuation_endpoint_uses_mocked_yfinance_snapshot(monkeypatch):
     monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: _snapshot(symbol))
 

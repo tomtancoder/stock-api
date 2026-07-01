@@ -26,16 +26,16 @@ def get_stock_snapshot(symbol: str) -> StockSnapshot:
 def _fetch_stock_snapshot(symbol: str) -> StockSnapshot:
     ticker = yf.Ticker(symbol)
 
-    try:
-        info = ticker.info or {}
-    except Exception as exc:  # pragma: no cover - depends on yFinance internals
-        raise YFinanceError(f"Could not fetch yFinance data for {symbol}.") from exc
+    warnings: list[str] = []
+    info = _safe_info(ticker, symbol, warnings)
+    fast_info = _safe_fast_info(ticker, warnings)
+    quote = _build_quote(symbol, info, fast_info, ticker, warnings)
 
-    if not info or info.get("quoteType") in (None, "NONE"):
+    if quote.current_price is None and not info:
+        raise YFinanceError(f"Could not fetch yFinance data for {symbol}.")
+    if info and info.get("quoteType") in (None, "NONE") and quote.current_price is None:
         raise ValueError(f"No yFinance data found for symbol {symbol}.")
 
-    warnings: list[str] = []
-    quote = _build_quote(symbol, info, warnings)
     financials = _build_financials(ticker, info, warnings)
 
     return StockSnapshot(
@@ -46,22 +46,50 @@ def _fetch_stock_snapshot(symbol: str) -> StockSnapshot:
     )
 
 
-def _build_quote(symbol: str, info: dict[str, Any], warnings: list[str]) -> QuoteResponse:
-    currency = info.get("financialCurrency") or info.get("currency")
+def _safe_info(ticker: yf.Ticker, symbol: str, warnings: list[str]) -> dict[str, Any]:
+    try:
+        return ticker.info or {}
+    except Exception as exc:  # pragma: no cover - depends on yFinance internals
+        warnings.append(f"Full yFinance quote info is unavailable for {symbol}: {exc}")
+        return {}
+
+
+def _safe_fast_info(ticker: yf.Ticker, warnings: list[str]) -> Any:
+    try:
+        return ticker.fast_info
+    except Exception as exc:  # pragma: no cover - depends on yFinance internals
+        warnings.append(f"Fast yFinance quote info is unavailable: {exc}")
+        return {}
+
+
+def _build_quote(
+    symbol: str,
+    info: dict[str, Any],
+    fast_info: Any,
+    ticker: yf.Ticker,
+    warnings: list[str],
+) -> QuoteResponse:
+    currency = info.get("financialCurrency") or info.get("currency") or _fast_info_value(
+        fast_info,
+        "currency",
+    )
     if not isinstance(currency, str) or not currency.strip():
         currency = None
         warnings.append("Currency is missing; amounts may not be comparable across markets.")
 
-    current_price = _first_number(
-        info,
-        "currentPrice",
-        "regularMarketPrice",
-        "previousClose",
+    current_price = (
+        _first_number(info, "currentPrice", "regularMarketPrice", "previousClose")
+        or _fast_info_number(fast_info, "last_price", "lastPrice", "regularMarketPreviousClose")
+        or _latest_close(ticker, warnings)
     )
     if current_price is None:
         warnings.append("Current price is missing.")
 
-    shares_outstanding = _first_number(info, "sharesOutstanding", "impliedSharesOutstanding")
+    shares_outstanding = _first_number(
+        info,
+        "sharesOutstanding",
+        "impliedSharesOutstanding",
+    ) or _fast_info_number(fast_info, "shares")
     if shares_outstanding is None:
         warnings.append("Shares outstanding is missing.")
 
@@ -71,7 +99,7 @@ def _build_quote(symbol: str, info: dict[str, Any], warnings: list[str]) -> Quot
         exchange=_to_string_or_none(info.get("exchange")),
         currency=currency,
         current_price=current_price,
-        market_cap=_first_number(info, "marketCap"),
+        market_cap=_first_number(info, "marketCap") or _fast_info_number(fast_info, "market_cap"),
         shares_outstanding=shares_outstanding,
         trailing_pe=_first_number(info, "trailingPE"),
         forward_pe=_first_number(info, "forwardPE"),
@@ -190,6 +218,46 @@ def _first_number(info: dict[str, Any], *keys: str) -> float | None:
         if number is not None:
             return number
     return None
+
+
+def _fast_info_number(fast_info: Any, *keys: str) -> float | None:
+    for key in keys:
+        number = _to_float_or_none(_fast_info_value(fast_info, key))
+        if number is not None:
+            return number
+    return None
+
+
+def _fast_info_value(fast_info: Any, key: str) -> Any:
+    if not fast_info:
+        return None
+    if hasattr(fast_info, "get"):
+        try:
+            value = fast_info.get(key)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+    try:
+        return getattr(fast_info, key)
+    except Exception:
+        return None
+
+
+def _latest_close(ticker: yf.Ticker, warnings: list[str]) -> float | None:
+    try:
+        history = ticker.history(period="5d")
+    except Exception as exc:  # pragma: no cover - depends on yFinance internals
+        warnings.append(f"Recent price history is unavailable from yFinance: {exc}")
+        return None
+
+    if history is None or history.empty or "Close" not in history:
+        return None
+
+    closes = history["Close"].dropna()
+    if closes.empty:
+        return None
+    return _to_float_or_none(closes.iloc[-1])
 
 
 def _to_float_or_none(value: Any) -> float | None:
