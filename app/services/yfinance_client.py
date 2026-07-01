@@ -8,6 +8,7 @@ from cachetools import TTLCache, cached
 from app.core.config import get_settings
 from app.schemas import FinancialMetrics, QuoteResponse, StockSnapshot
 
+_quote_cache = TTLCache(maxsize=1024, ttl=get_settings().cache_ttl_seconds)
 _snapshot_cache = TTLCache(maxsize=512, ttl=get_settings().cache_ttl_seconds)
 
 
@@ -16,10 +17,26 @@ class YFinanceError(RuntimeError):
 
 
 def get_stock_snapshot(symbol: str) -> StockSnapshot:
-    normalized_symbol = symbol.strip().upper()
-    if not normalized_symbol:
-        raise ValueError("Stock symbol is required.")
+    normalized_symbol = _normalize_symbol(symbol)
     return _fetch_stock_snapshot(normalized_symbol)
+
+
+def get_stock_quote(symbol: str) -> QuoteResponse:
+    normalized_symbol = _normalize_symbol(symbol)
+    return _fetch_stock_quote(normalized_symbol)
+
+
+@cached(cache=_quote_cache)
+def _fetch_stock_quote(symbol: str) -> QuoteResponse:
+    ticker = yf.Ticker(symbol)
+    warnings: list[str] = []
+    fast_info = _safe_fast_info(ticker, warnings)
+    quote = _build_quote(symbol, {}, fast_info, ticker, warnings)
+
+    if quote.current_price is None:
+        raise YFinanceError(f"Could not fetch yFinance quote data for {symbol}.")
+
+    return quote
 
 
 @cached(cache=_snapshot_cache)
@@ -44,6 +61,13 @@ def _fetch_stock_snapshot(symbol: str) -> StockSnapshot:
         financials=financials,
         warnings=_dedupe(warnings),
     )
+
+
+def _normalize_symbol(symbol: str) -> str:
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise ValueError("Stock symbol is required.")
+    return normalized_symbol
 
 
 def _safe_info(ticker: yf.Ticker, symbol: str, warnings: list[str]) -> dict[str, Any]:

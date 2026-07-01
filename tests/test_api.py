@@ -25,6 +25,25 @@ def test_root_points_to_docs_and_health():
     }
 
 
+def test_quote_endpoint_uses_lightweight_quote_fetch(monkeypatch):
+    monkeypatch.setattr(
+        yfinance_client,
+        "get_stock_quote",
+        lambda symbol: QuoteResponse(
+            symbol=symbol.upper(),
+            currency="SGD",
+            current_price=65.43,
+            warnings=[],
+        ),
+    )
+
+    response = client.get("/api/v1/stocks/D05.SI/quote")
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "D05.SI"
+    assert response.json()["warnings"] == []
+
+
 def test_valuation_endpoint_uses_mocked_yfinance_snapshot(monkeypatch):
     monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: _snapshot(symbol))
 

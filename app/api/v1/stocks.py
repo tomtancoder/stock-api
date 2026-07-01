@@ -15,8 +15,12 @@ router = APIRouter(prefix="/stocks", tags=["stocks"])
 
 @router.get("/{symbol}/quote", response_model=QuoteResponse)
 def quote(symbol: str = Path(..., min_length=1, max_length=32)) -> QuoteResponse:
-    snapshot = _load_snapshot(symbol)
-    return snapshot.quote
+    try:
+        return yfinance_client.get_stock_quote(symbol)
+    except YFinanceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/{symbol}/fundamentals", response_model=FundamentalsResponse)

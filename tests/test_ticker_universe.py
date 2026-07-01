@@ -30,7 +30,7 @@ def test_sample_universe_has_600_us_and_singapore_tickers():
 
 @pytest.mark.parametrize("symbol", SAMPLE_600_TICKERS)
 def test_quote_endpoint_accepts_sample_ticker_universe(monkeypatch, symbol):
-    monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda value: _snapshot(value))
+    monkeypatch.setattr(yfinance_client, "get_stock_quote", lambda value: _snapshot(value).quote)
 
     response = client.get(f"/api/v1/stocks/{symbol}/quote")
 

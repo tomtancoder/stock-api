@@ -59,3 +59,13 @@ Example valuation request:
 ```
 
 All valuation assumptions are optional. Missing values use conservative defaults from the application settings.
+
+## yFinance Rate Limits
+
+Quote requests use a lightweight yFinance path and are cached for 1 hour by default. You can change the cache duration with:
+
+```powershell
+$env:STOCK_API_CACHE_TTL_SECONDS = "3600"
+```
+
+On Render, set the same value in the service environment variables.
