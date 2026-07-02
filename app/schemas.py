@@ -4,11 +4,21 @@ from pydantic import BaseModel, ConfigDict, Field
 class QuoteResponse(BaseModel):
     symbol: str
     short_name: str | None = None
+    long_name: str | None = None
     exchange: str | None = None
     currency: str | None = None
     current_price: float | None = None
+    previous_close: float | None = None
+    price_change: float | None = None
+    price_change_percent: float | None = None
+    volume: float | None = None
+    average_volume: float | None = None
     market_cap: float | None = None
     shares_outstanding: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    fifty_two_week_high: float | None = None
+    fifty_two_week_low: float | None = None
     trailing_pe: float | None = None
     forward_pe: float | None = None
     price_to_book: float | None = None

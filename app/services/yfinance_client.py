@@ -31,7 +31,8 @@ def _fetch_stock_quote(symbol: str) -> QuoteResponse:
     ticker = yf.Ticker(symbol)
     warnings: list[str] = []
     fast_info = _safe_fast_info(ticker, warnings)
-    quote = _build_quote(symbol, {}, fast_info, ticker, warnings)
+    info = _safe_info(ticker, symbol, warnings)
+    quote = _build_quote(symbol, info, fast_info, ticker, warnings)
 
     if quote.current_price is None:
         raise YFinanceError(f"Could not fetch yFinance quote data for {symbol}.")
@@ -93,6 +94,7 @@ def _build_quote(
     ticker: yf.Ticker,
     warnings: list[str],
 ) -> QuoteResponse:
+    history = _safe_history(ticker, warnings)
     currency = info.get("financialCurrency") or info.get("currency") or _fast_info_value(
         fast_info,
         "currency",
@@ -104,10 +106,18 @@ def _build_quote(
     current_price = (
         _first_number(info, "currentPrice", "regularMarketPrice", "previousClose")
         or _fast_info_number(fast_info, "last_price", "lastPrice", "regularMarketPreviousClose")
-        or _latest_close(ticker, warnings)
+        or _latest_history_number(history, "Close")
     )
     if current_price is None:
         warnings.append("Current price is missing.")
+
+    previous_close = _first_number(
+        info,
+        "regularMarketPreviousClose",
+        "previousClose",
+    ) or _fast_info_number(fast_info, "regularMarketPreviousClose", "previousClose")
+    price_change = _price_change(current_price, previous_close)
+    price_change_percent = _price_change_percent(price_change, previous_close)
 
     shares_outstanding = _first_number(
         info,
@@ -120,11 +130,31 @@ def _build_quote(
     return QuoteResponse(
         symbol=symbol,
         short_name=_to_string_or_none(info.get("shortName") or info.get("longName")),
-        exchange=_to_string_or_none(info.get("exchange")),
+        long_name=_to_string_or_none(info.get("longName")),
+        exchange=_to_string_or_none(info.get("exchange") or _fast_info_value(fast_info, "exchange")),
         currency=currency,
         current_price=current_price,
-        market_cap=_first_number(info, "marketCap") or _fast_info_number(fast_info, "market_cap"),
+        previous_close=previous_close,
+        price_change=_round_value(price_change),
+        price_change_percent=_round_value(price_change_percent),
+        volume=_first_number(info, "regularMarketVolume", "volume")
+        or _fast_info_number(fast_info, "lastVolume", "last_volume")
+        or _latest_history_number(history, "Volume"),
+        average_volume=_first_number(info, "averageVolume", "averageDailyVolume10Day")
+        or _fast_info_number(fast_info, "threeMonthAverageVolume", "tenDayAverageVolume"),
+        market_cap=_first_number(info, "marketCap")
+        or _fast_info_number(fast_info, "marketCap", "market_cap"),
         shares_outstanding=shares_outstanding,
+        day_high=_first_number(info, "dayHigh", "regularMarketDayHigh")
+        or _fast_info_number(fast_info, "dayHigh", "day_high")
+        or _latest_history_number(history, "High"),
+        day_low=_first_number(info, "dayLow", "regularMarketDayLow")
+        or _fast_info_number(fast_info, "dayLow", "day_low")
+        or _latest_history_number(history, "Low"),
+        fifty_two_week_high=_first_number(info, "fiftyTwoWeekHigh")
+        or _fast_info_number(fast_info, "yearHigh", "year_high"),
+        fifty_two_week_low=_first_number(info, "fiftyTwoWeekLow")
+        or _fast_info_number(fast_info, "yearLow", "year_low"),
         trailing_pe=_first_number(info, "trailingPE"),
         forward_pe=_first_number(info, "forwardPE"),
         price_to_book=_first_number(info, "priceToBook"),
@@ -268,20 +298,47 @@ def _fast_info_value(fast_info: Any, key: str) -> Any:
         return None
 
 
-def _latest_close(ticker: yf.Ticker, warnings: list[str]) -> float | None:
+def _safe_history(ticker: yf.Ticker, warnings: list[str]) -> pd.DataFrame:
     try:
         history = ticker.history(period="5d")
     except Exception as exc:  # pragma: no cover - depends on yFinance internals
         warnings.append(f"Recent price history is unavailable from yFinance: {exc}")
+        return pd.DataFrame()
+
+    if history is None or history.empty:
+        return pd.DataFrame()
+    return history
+
+
+def _latest_history_number(history: pd.DataFrame, column: str) -> float | None:
+    if history.empty or column not in history:
         return None
 
-    if history is None or history.empty or "Close" not in history:
+    values = history[column].dropna()
+    if values.empty:
         return None
+    return _to_float_or_none(values.iloc[-1])
 
-    closes = history["Close"].dropna()
-    if closes.empty:
+
+def _price_change(current_price: float | None, previous_close: float | None) -> float | None:
+    if current_price is None or previous_close is None:
         return None
-    return _to_float_or_none(closes.iloc[-1])
+    return current_price - previous_close
+
+
+def _price_change_percent(
+    price_change: float | None,
+    previous_close: float | None,
+) -> float | None:
+    if price_change is None or previous_close in (None, 0):
+        return None
+    return (price_change / previous_close) * 100
+
+
+def _round_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value, 4)
 
 
 def _to_float_or_none(value: Any) -> float | None:
