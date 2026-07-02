@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 
+from app.api.v1 import stocks
 from app.main import app
-from app.schemas import FinancialMetrics, QuoteResponse, StockSnapshot
+from app.schemas import EmaValues, FinancialMetrics, QuoteResponse, StockSnapshot, TechnicalsResponse
 from app.services import yfinance_client
 
 client = TestClient(app)
@@ -42,6 +43,37 @@ def test_quote_endpoint_uses_lightweight_quote_fetch(monkeypatch):
     assert response.status_code == 200
     assert response.json()["symbol"] == "D05.SI"
     assert response.json()["warnings"] == []
+
+
+def test_technicals_endpoint_returns_ema_values(monkeypatch):
+    monkeypatch.setattr(
+        stocks,
+        "get_stock_technicals",
+        lambda symbol, period, interval: TechnicalsResponse(
+            symbol=symbol.upper(),
+            period=period,
+            interval=interval,
+            as_of="2026-07-02T00:00:00",
+            latest_close=410.72,
+            ema=EmaValues(
+                ema_21=404.1296,
+                ema_50=403.9709,
+                ema_100=404.1072,
+                ema_200=398.3258,
+            ),
+            warnings=[],
+        ),
+    )
+
+    response = client.get("/api/v1/stocks/TSLA/technicals")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["symbol"] == "TSLA"
+    assert payload["period"] == "1y"
+    assert payload["interval"] == "1d"
+    assert payload["ema"]["ema_21"] == 404.1296
+    assert payload["ema"]["ema_200"] == 398.3258
 
 
 def test_valuation_endpoint_uses_mocked_yfinance_snapshot(monkeypatch):

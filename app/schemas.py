@@ -46,6 +46,23 @@ class FundamentalsResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EmaValues(BaseModel):
+    ema_21: float | None = None
+    ema_50: float | None = None
+    ema_100: float | None = None
+    ema_200: float | None = None
+
+
+class TechnicalsResponse(BaseModel):
+    symbol: str
+    period: str
+    interval: str
+    as_of: str | None = None
+    latest_close: float | None = None
+    ema: EmaValues
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ValuationRequest(BaseModel):
     discount_rate: float | None = Field(default=None, gt=0, lt=1)
     terminal_growth_rate: float | None = Field(default=None, ge=0, lt=0.10)
