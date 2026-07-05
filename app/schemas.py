@@ -64,6 +64,20 @@ class TechnicalsResponse(BaseModel):
 
 
 class ValuationRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "discount_rate": 0.10,
+                    "terminal_growth_rate": 0.025,
+                    "projection_years": 5,
+                    "margin_of_safety": 0.25,
+                    "growth_rate": 0.08,
+                }
+            ]
+        }
+    )
+
     discount_rate: float | None = Field(default=None, gt=0, lt=1)
     terminal_growth_rate: float | None = Field(default=None, ge=0, lt=0.10)
     projection_years: int | None = Field(default=None, ge=1, le=10)

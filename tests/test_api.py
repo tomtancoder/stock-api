@@ -98,6 +98,16 @@ def test_valuation_endpoint_uses_mocked_yfinance_snapshot(monkeypatch):
     assert payload["ratios"]["trailing_pe"] == 20
 
 
+def test_valuation_openapi_example_is_valid_for_execute(monkeypatch):
+    monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: _snapshot(symbol))
+    example = app.openapi()["components"]["schemas"]["ValuationRequest"]["examples"][0]
+
+    response = client.post("/api/v1/stocks/ACME/valuation", json=example)
+
+    assert response.status_code == 200
+    assert response.json()["assumptions"] == example
+
+
 def test_fundamentals_endpoint_returns_data_quality_warnings(monkeypatch):
     snapshot = _snapshot("ACME")
     snapshot.warnings.append("Currency is missing; amounts may not be comparable across markets.")
