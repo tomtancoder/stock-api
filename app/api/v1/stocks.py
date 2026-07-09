@@ -1,72 +1,64 @@
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Path, Query
 
-from app.schemas import (
-    FundamentalsResponse,
-    QuoteResponse,
-    TechnicalsResponse,
-    ValuationRequest,
-    ValuationResponse,
-)
-from app.services import yfinance_client
-from app.services.technicals import get_stock_technicals
-from app.services.valuation import build_valuation
-from app.services.yfinance_client import YFinanceError
+from app.core.config import get_settings
+from app.schemas import QuoteResponse, TradeScoreResponse
+from app.services import tradingview_provider as provider
+from app.services.tradingview_provider import TradingViewProviderError
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
 
 
 @router.get("/{symbol}/quote", response_model=QuoteResponse)
-def quote(symbol: str = Path(..., min_length=1, max_length=32)) -> QuoteResponse:
-    try:
-        return yfinance_client.get_stock_quote(symbol)
-    except YFinanceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+def quote(
+    symbol: str = Path(..., min_length=1, max_length=64),
+    exchange: str | None = Query(default=None, min_length=1, max_length=32),
+) -> dict[str, Any]:
+    return _provider_response(provider.get_quote, exchange or get_settings().default_exchange, symbol)
 
 
-@router.get("/{symbol}/fundamentals", response_model=FundamentalsResponse)
-def fundamentals(
-    symbol: str = Path(..., min_length=1, max_length=32),
-) -> FundamentalsResponse:
-    snapshot = _load_snapshot(symbol)
-    return FundamentalsResponse(
-        symbol=snapshot.symbol,
-        currency=snapshot.quote.currency,
-        financials=snapshot.financials,
-        shares_outstanding=snapshot.quote.shares_outstanding,
-        warnings=snapshot.warnings,
+@router.get("/{symbol}/fundamentals")
+def fundamentals(symbol: str = Path(..., min_length=1, max_length=64)) -> None:
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Fundamentals are not supported by the TradingView MCP provider. "
+            "Use /api/v1/markets/{exchange}/{symbol}/analysis or /score for trading signals."
+        ),
     )
 
 
-@router.get("/{symbol}/technicals", response_model=TechnicalsResponse)
+@router.get("/{symbol}/technicals")
 def technicals(
-    symbol: str = Path(..., min_length=1, max_length=32),
-    period: str = Query(default="1y", min_length=1, max_length=16),
-    interval: str = Query(default="1d", min_length=1, max_length=16),
-) -> TechnicalsResponse:
-    try:
-        return get_stock_technicals(symbol=symbol, period=period, interval=interval)
-    except YFinanceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    symbol: str = Path(..., min_length=1, max_length=64),
+    exchange: str | None = Query(default=None, min_length=1, max_length=32),
+    timeframe: str | None = Query(default=None, min_length=1, max_length=16),
+) -> dict[str, Any]:
+    return _provider_response(
+        provider.get_analysis,
+        exchange or get_settings().default_exchange,
+        symbol,
+        timeframe or get_settings().default_timeframe,
+    )
 
 
-@router.post("/{symbol}/valuation", response_model=ValuationResponse)
+@router.post("/{symbol}/valuation", response_model=TradeScoreResponse)
 def valuation(
-    request: ValuationRequest | None = None,
-    symbol: str = Path(..., min_length=1, max_length=32),
-) -> ValuationResponse:
-    snapshot = _load_snapshot(symbol)
-    assumptions = request or ValuationRequest()
-    return build_valuation(snapshot=snapshot, overrides=assumptions)
+    symbol: str = Path(..., min_length=1, max_length=64),
+    exchange: str | None = Query(default=None, min_length=1, max_length=32),
+    timeframe: str | None = Query(default=None, min_length=1, max_length=16),
+) -> dict[str, Any]:
+    return _provider_response(
+        provider.get_trade_score,
+        exchange or get_settings().default_exchange,
+        symbol,
+        timeframe or get_settings().default_timeframe,
+    )
 
 
-def _load_snapshot(symbol: str):
+def _provider_response(func, *args):
     try:
-        return yfinance_client.get_stock_snapshot(symbol)
-    except YFinanceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return func(*args)
+    except TradingViewProviderError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

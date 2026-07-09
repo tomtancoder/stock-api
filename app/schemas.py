@@ -1,125 +1,65 @@
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class QuoteResponse(BaseModel):
     symbol: str
-    short_name: str | None = None
-    long_name: str | None = None
-    exchange: str | None = None
-    currency: str | None = None
-    current_price: float | None = None
+    exchange: str
+    price: float | None = None
     previous_close: float | None = None
-    price_change: float | None = None
-    price_change_percent: float | None = None
-    volume: float | None = None
-    average_volume: float | None = None
-    market_cap: float | None = None
-    shares_outstanding: float | None = None
-    day_high: float | None = None
-    day_low: float | None = None
-    fifty_two_week_high: float | None = None
-    fifty_two_week_low: float | None = None
-    trailing_pe: float | None = None
-    forward_pe: float | None = None
-    price_to_book: float | None = None
-    enterprise_to_ebitda: float | None = None
-    dividend_yield: float | None = None
-    warnings: list[str] = Field(default_factory=list)
-
-
-class FinancialMetrics(BaseModel):
-    revenue: float | None = None
-    net_income: float | None = None
-    free_cash_flow: float | None = None
-    operating_cash_flow: float | None = None
-    capital_expenditures: float | None = None
-    total_debt: float | None = None
-    cash_and_equivalents: float | None = None
-    total_equity: float | None = None
-
-
-class FundamentalsResponse(BaseModel):
-    symbol: str
+    change: float | None = None
+    change_percent: float | None = None
     currency: str | None = None
-    financials: FinancialMetrics
-    shares_outstanding: float | None = None
+    market_state: str | None = None
+    source: str | None = None
+    timestamp: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
-class EmaValues(BaseModel):
-    ema_21: float | None = None
-    ema_50: float | None = None
-    ema_100: float | None = None
-    ema_200: float | None = None
-
-
-class TechnicalsResponse(BaseModel):
-    symbol: str
-    period: str
-    interval: str
-    as_of: str | None = None
-    latest_close: float | None = None
-    ema: EmaValues
-    warnings: list[str] = Field(default_factory=list)
-
-
-class ValuationRequest(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "discount_rate": 0.10,
-                    "terminal_growth_rate": 0.025,
-                    "projection_years": 5,
-                    "margin_of_safety": 0.25,
-                    "growth_rate": 0.08,
-                }
-            ]
-        }
-    )
-
-    discount_rate: float | None = Field(default=None, gt=0, lt=1)
-    terminal_growth_rate: float | None = Field(default=None, ge=0, lt=0.10)
-    projection_years: int | None = Field(default=None, ge=1, le=10)
-    margin_of_safety: float | None = Field(default=None, ge=0, lt=1)
-    growth_rate: float | None = Field(default=None, ge=-0.50, lt=1)
-
-
-class ValuationAssumptions(BaseModel):
-    discount_rate: float
-    terminal_growth_rate: float
-    projection_years: int
-    margin_of_safety: float
-    growth_rate: float
-
-
-class ValuationRatios(BaseModel):
-    trailing_pe: float | None = None
-    forward_pe: float | None = None
-    price_to_book: float | None = None
-    enterprise_to_ebitda: float | None = None
-    dividend_yield: float | None = None
-    market_cap_to_free_cash_flow: float | None = None
-
-
-class ValuationResponse(BaseModel):
+class TradeScoreResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     symbol: str
-    currency: str | None = None
-    current_price: float | None = None
-    intrinsic_value_per_share: float | None = None
-    margin_of_safety_price: float | None = None
-    upside_downside_percent: float | None = None
-    enterprise_value: float | None = None
-    equity_value: float | None = None
-    assumptions: ValuationAssumptions
-    ratios: ValuationRatios
+    exchange: str
+    timeframe: str
+    score: float | None = None
+    score_source: str
+    signal: str | None = None
+    grade: str | None = None
+    trend_state: str | None = None
+    price_data: dict[str, Any] = Field(default_factory=dict)
+    trade_setup: dict[str, Any] | None = None
+    risk_reward: float | None = None
+    key_indicators: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
-class StockSnapshot(BaseModel):
-    symbol: str
-    quote: QuoteResponse
-    financials: FinancialMetrics
-    warnings: list[str] = Field(default_factory=list)
+class BacktestRequest(BaseModel):
+    strategy: str = Field(default="rsi", min_length=1)
+    period: str = Field(default="1y", min_length=1, max_length=16)
+    initial_capital: float = Field(default=10_000.0, gt=0)
+    commission_pct: float = Field(default=0.1, ge=0)
+    slippage_pct: float = Field(default=0.05, ge=0)
+    interval: str = Field(default="1d", min_length=1, max_length=16)
+    include_trade_log: bool = False
+    include_equity_curve: bool = False
+
+
+class CompareStrategiesRequest(BaseModel):
+    period: str = Field(default="1y", min_length=1, max_length=16)
+    initial_capital: float = Field(default=10_000.0, gt=0)
+    commission_pct: float = Field(default=0.1, ge=0)
+    slippage_pct: float = Field(default=0.05, ge=0)
+    interval: str = Field(default="1d", min_length=1, max_length=16)
+
+
+class WalkForwardBacktestRequest(BaseModel):
+    strategy: str = Field(default="rsi", min_length=1)
+    period: str = Field(default="2y", min_length=1, max_length=16)
+    initial_capital: float = Field(default=10_000.0, gt=0)
+    commission_pct: float = Field(default=0.1, ge=0)
+    slippage_pct: float = Field(default=0.05, ge=0)
+    n_splits: int = Field(default=3, ge=2, le=10)
+    train_ratio: float = Field(default=0.7, gt=0, lt=1)
+    interval: str = Field(default="1d", min_length=1, max_length=16)

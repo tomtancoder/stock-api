@@ -1,1 +1,1 @@
-"""Stock valuation API package."""
+"""Trading intelligence API package."""

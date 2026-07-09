@@ -1,18 +1,21 @@
 from fastapi import FastAPI
 
+from app.api.v1.backtests import router as backtests_router
+from app.api.v1.intelligence import router as intelligence_router
+from app.api.v1.markets import router as markets_router
 from app.api.v1.stocks import router as stocks_router
 
 app = FastAPI(
-    title="Stock Valuation API",
+    title="Trading Intelligence API",
     version="0.1.0",
-    description="Quote, fundamentals, and intrinsic-value estimates powered by yFinance.",
+    description="Market quotes, technical analysis, trade scores, screeners, sentiment, and backtests powered by TradingView MCP.",
 )
 
 
 @app.get("/", tags=["health"])
 def root() -> dict[str, str]:
     return {
-        "name": "Stock Valuation API",
+        "name": "Trading Intelligence API",
         "docs": "/docs",
         "health": "/health",
     }
@@ -24,3 +27,6 @@ def health() -> dict[str, str]:
 
 
 app.include_router(stocks_router, prefix="/api/v1")
+app.include_router(markets_router, prefix="/api/v1")
+app.include_router(backtests_router, prefix="/api/v1")
+app.include_router(intelligence_router, prefix="/api/v1")

@@ -1,9 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.api.v1 import stocks
 from app.main import app
-from app.schemas import EmaValues, FinancialMetrics, QuoteResponse, StockSnapshot, TechnicalsResponse
-from app.services import yfinance_client
 
 client = TestClient(app)
 
@@ -15,132 +12,323 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
-def test_root_points_to_docs_and_health():
+def test_root_points_to_trading_intelligence_docs():
     response = client.get("/")
 
     assert response.status_code == 200
     assert response.json() == {
-        "name": "Stock Valuation API",
+        "name": "Trading Intelligence API",
         "docs": "/docs",
         "health": "/health",
     }
 
 
-def test_quote_endpoint_uses_lightweight_quote_fetch(monkeypatch):
-    monkeypatch.setattr(
-        yfinance_client,
-        "get_stock_quote",
-        lambda symbol: QuoteResponse(
-            symbol=symbol.upper(),
-            currency="SGD",
-            current_price=65.43,
-            warnings=[],
-        ),
-    )
+def test_market_quote_endpoint_uses_tradingview_provider(monkeypatch):
+    from app.api.v1 import markets
 
-    response = client.get("/api/v1/stocks/D05.SI/quote")
+    def fake_quote(exchange: str, symbol: str):
+        assert exchange == "NASDAQ"
+        assert symbol == "TSLA"
+        return {
+            "symbol": "TSLA",
+            "exchange": "NASDAQ",
+            "price": 428.11,
+            "previous_close": 423.19,
+            "change": 4.92,
+            "change_percent": 1.1626,
+            "currency": "USD",
+            "market_state": "REGULAR",
+            "source": "Yahoo Finance",
+            "timestamp": "2026-07-09T00:00:00+00:00",
+            "warnings": [],
+        }
 
-    assert response.status_code == 200
-    assert response.json()["symbol"] == "D05.SI"
-    assert response.json()["warnings"] == []
+    monkeypatch.setattr(markets.provider, "get_quote", fake_quote)
 
-
-def test_technicals_endpoint_returns_ema_values(monkeypatch):
-    monkeypatch.setattr(
-        stocks,
-        "get_stock_technicals",
-        lambda symbol, period, interval: TechnicalsResponse(
-            symbol=symbol.upper(),
-            period=period,
-            interval=interval,
-            as_of="2026-07-02T00:00:00",
-            latest_close=410.72,
-            ema=EmaValues(
-                ema_21=404.1296,
-                ema_50=403.9709,
-                ema_100=404.1072,
-                ema_200=398.3258,
-            ),
-            warnings=[],
-        ),
-    )
-
-    response = client.get("/api/v1/stocks/TSLA/technicals")
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/quote")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["symbol"] == "TSLA"
-    assert payload["period"] == "1y"
-    assert payload["interval"] == "1d"
-    assert payload["ema"]["ema_21"] == 404.1296
-    assert payload["ema"]["ema_200"] == 398.3258
+    assert payload["exchange"] == "NASDAQ"
+    assert payload["price"] == 428.11
+    assert payload["change_percent"] == 1.1626
 
 
-def test_valuation_endpoint_uses_mocked_yfinance_snapshot(monkeypatch):
-    monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: _snapshot(symbol))
+def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
+    from app.api.v1 import markets
 
-    response = client.post(
-        "/api/v1/stocks/ACME/valuation",
-        json={
-            "discount_rate": 0.10,
-            "terminal_growth_rate": 0.02,
-            "projection_years": 5,
-            "margin_of_safety": 0.25,
-            "growth_rate": 0.03,
-        },
-    )
+    def fake_analysis(exchange: str, symbol: str, timeframe: str):
+        assert (exchange, symbol, timeframe) == ("NASDAQ", "TSLA", "1D")
+        return {
+            "symbol": "NASDAQ:TSLA",
+            "exchange": "NASDAQ",
+            "timeframe": "1D",
+            "price_data": {"current_price": 428.11, "volume": 44_000_000},
+            "rsi": {"value": 61.2, "signal": "Bullish"},
+            "market_sentiment": {"overall_rating": 2, "buy_sell_signal": "BUY"},
+        }
+
+    monkeypatch.setattr(markets.provider, "get_analysis", fake_analysis)
+
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/analysis")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["symbol"] == "ACME"
-    assert payload["currency"] == "USD"
-    assert payload["intrinsic_value_per_share"] == 130.5
-    assert payload["ratios"]["trailing_pe"] == 20
+    assert payload["symbol"] == "NASDAQ:TSLA"
+    assert payload["rsi"]["signal"] == "Bullish"
+    assert payload["market_sentiment"]["buy_sell_signal"] == "BUY"
 
 
-def test_valuation_openapi_example_is_valid_for_execute(monkeypatch):
-    monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: _snapshot(symbol))
-    example = app.openapi()["components"]["schemas"]["ValuationRequest"]["examples"][0]
+def test_market_score_endpoint_returns_trade_score(monkeypatch):
+    from app.api.v1 import markets
 
-    response = client.post("/api/v1/stocks/ACME/valuation", json=example)
+    def fake_score(exchange: str, symbol: str, timeframe: str):
+        assert (exchange, symbol, timeframe) == ("NASDAQ", "TSLA", "1D")
+        return {
+            "symbol": "NASDAQ:TSLA",
+            "exchange": "NASDAQ",
+            "timeframe": "1D",
+            "score": 87.0,
+            "score_source": "stock_score",
+            "signal": "BUY",
+            "grade": "A",
+            "trend_state": "bullish",
+            "price_data": {"current_price": 428.11},
+            "trade_setup": {"risk_reward": 2.4},
+            "risk_reward": 2.4,
+            "key_indicators": {"rsi": {"value": 61.2}},
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(markets.provider, "get_trade_score", fake_score)
+
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/score")
 
     assert response.status_code == 200
-    assert response.json()["assumptions"] == example
+    payload = response.json()
+    assert payload["score"] == 87.0
+    assert payload["score_source"] == "stock_score"
+    assert payload["risk_reward"] == 2.4
 
 
-def test_fundamentals_endpoint_returns_data_quality_warnings(monkeypatch):
-    snapshot = _snapshot("ACME")
-    snapshot.warnings.append("Currency is missing; amounts may not be comparable across markets.")
-    monkeypatch.setattr(yfinance_client, "get_stock_snapshot", lambda symbol: snapshot)
+def test_market_sgx_endpoints_accept_singapore_symbols(monkeypatch):
+    from app.api.v1 import markets
 
-    response = client.get("/api/v1/stocks/ACME/fundamentals")
+    calls = []
 
-    assert response.status_code == 200
-    assert response.json()["warnings"] == [
-        "Currency is missing; amounts may not be comparable across markets."
+    monkeypatch.setattr(
+        markets.provider,
+        "get_quote",
+        lambda exchange, symbol: calls.append(("quote", exchange, symbol))
+        or {
+            "symbol": "D05.SI",
+            "exchange": "SGX",
+            "price": 70.02,
+            "currency": "SGD",
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_analysis",
+        lambda exchange, symbol, timeframe: calls.append(("analysis", exchange, symbol, timeframe))
+        or {
+            "symbol": "SGX:D05",
+            "exchange": "sgx",
+            "timeframe": "1D",
+            "price_data": {"current_price": 70.02},
+        },
+    )
+
+    quote = client.get("/api/v1/markets/SGX/D05/quote").json()
+    analysis = client.get("/api/v1/markets/SGX/D05.SI/analysis?timeframe=1D").json()
+
+    assert quote["symbol"] == "D05.SI"
+    assert quote["currency"] == "SGD"
+    assert analysis["symbol"] == "SGX:D05"
+    assert calls == [
+        ("quote", "SGX", "D05"),
+        ("analysis", "SGX", "D05.SI", "1D"),
     ]
 
 
-def _snapshot(symbol: str) -> StockSnapshot:
-    return StockSnapshot(
-        symbol=symbol.upper(),
-        quote=QuoteResponse(
-            symbol=symbol.upper(),
-            currency="USD",
-            current_price=80,
-            market_cap=8_000,
-            shares_outstanding=100,
-            trailing_pe=20,
-            forward_pe=18,
-            price_to_book=4,
-            enterprise_to_ebitda=12,
-            dividend_yield=0.01,
-        ),
-        financials=FinancialMetrics(
-            revenue=5_000,
-            net_income=700,
-            free_cash_flow=1_000,
-            total_debt=500,
-            cash_and_equivalents=250,
-        ),
+def test_market_screener_endpoints_delegate_to_provider(monkeypatch):
+    from app.api.v1 import markets
+
+    calls = []
+
+    monkeypatch.setattr(
+        markets.provider,
+        "get_gainers",
+        lambda exchange, timeframe, limit: calls.append(("gainers", exchange, timeframe, limit))
+        or [{"symbol": "NASDAQ:TSLA"}],
     )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_losers",
+        lambda exchange, timeframe, limit: calls.append(("losers", exchange, timeframe, limit))
+        or [{"symbol": "NASDAQ:AAPL"}],
+    )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_bollinger_scan",
+        lambda exchange, timeframe, bbw_threshold, limit: calls.append(
+            ("bollinger", exchange, timeframe, bbw_threshold, limit)
+        )
+        or [{"symbol": "NASDAQ:NVDA"}],
+    )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_rating_filter",
+        lambda exchange, timeframe, rating, limit: calls.append(
+            ("rating", exchange, timeframe, rating, limit)
+        )
+        or [{"symbol": "NASDAQ:MSFT"}],
+    )
+
+    assert client.get("/api/v1/markets/NASDAQ/gainers?timeframe=1D&limit=3").json() == [
+        {"symbol": "NASDAQ:TSLA"}
+    ]
+    assert client.get("/api/v1/markets/NASDAQ/losers?timeframe=1D&limit=2").json() == [
+        {"symbol": "NASDAQ:AAPL"}
+    ]
+    assert client.get("/api/v1/markets/NASDAQ/bollinger-scan?bbw_threshold=0.05").json() == [
+        {"symbol": "NASDAQ:NVDA"}
+    ]
+    assert client.get("/api/v1/markets/NASDAQ/rating-filter?rating=2").json() == [
+        {"symbol": "NASDAQ:MSFT"}
+    ]
+    assert calls == [
+        ("gainers", "NASDAQ", "1D", 3),
+        ("losers", "NASDAQ", "1D", 2),
+        ("bollinger", "NASDAQ", "1D", 0.05, 50),
+        ("rating", "NASDAQ", "1D", 2, 25),
+    ]
+
+
+def test_backtest_endpoints_delegate_to_provider(monkeypatch):
+    from app.api.v1 import backtests
+
+    calls = []
+    monkeypatch.setattr(
+        backtests.provider,
+        "run_backtest",
+        lambda exchange, symbol, request: calls.append(("run", exchange, symbol, request.strategy))
+        or {"symbol": "NASDAQ:TSLA", "strategy": request.strategy},
+    )
+    monkeypatch.setattr(
+        backtests.provider,
+        "compare_strategies",
+        lambda exchange, symbol, request: calls.append(("compare", exchange, symbol, request.period))
+        or {"symbol": "NASDAQ:TSLA", "leaderboard": []},
+    )
+    monkeypatch.setattr(
+        backtests.provider,
+        "walk_forward_backtest",
+        lambda exchange, symbol, request: calls.append(("walk", exchange, symbol, request.strategy))
+        or {"symbol": "NASDAQ:TSLA", "folds": []},
+    )
+
+    assert client.post("/api/v1/backtests/NASDAQ/TSLA", json={"strategy": "rsi"}).json()[
+        "strategy"
+    ] == "rsi"
+    assert client.post("/api/v1/backtests/NASDAQ/TSLA/compare", json={"period": "2y"}).json()[
+        "leaderboard"
+    ] == []
+    assert client.post(
+        "/api/v1/backtests/NASDAQ/TSLA/walk-forward", json={"strategy": "macd"}
+    ).json()["folds"] == []
+    assert calls == [
+        ("run", "NASDAQ", "TSLA", "rsi"),
+        ("compare", "NASDAQ", "TSLA", "2y"),
+        ("walk", "NASDAQ", "TSLA", "macd"),
+    ]
+
+
+def test_sentiment_and_news_endpoints_delegate_to_provider(monkeypatch):
+    from app.api.v1 import intelligence
+
+    monkeypatch.setattr(
+        intelligence.provider,
+        "get_sentiment",
+        lambda symbol, category, limit: {
+            "symbol": symbol,
+            "sentiment_label": "Bullish",
+            "posts_analyzed": limit,
+            "category": category,
+        },
+    )
+    monkeypatch.setattr(
+        intelligence.provider,
+        "get_news",
+        lambda symbol, category, limit: {
+            "symbol": symbol,
+            "category": category,
+            "items": [{"title": "Market update"}],
+            "limit": limit,
+        },
+    )
+
+    sentiment = client.get("/api/v1/sentiment/TSLA?category=stocks&limit=5").json()
+    news = client.get("/api/v1/news?symbol=TSLA&category=stocks&limit=3").json()
+
+    assert sentiment["sentiment_label"] == "Bullish"
+    assert sentiment["posts_analyzed"] == 5
+    assert news["items"][0]["title"] == "Market update"
+    assert news["limit"] == 3
+
+
+def test_stock_routes_remain_compatibility_aliases(monkeypatch):
+    from app.api.v1 import stocks
+
+    monkeypatch.setattr(
+        stocks.provider,
+        "get_quote",
+        lambda exchange, symbol: {
+            "symbol": symbol,
+            "exchange": exchange,
+            "price": 428.11,
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        stocks.provider,
+        "get_analysis",
+        lambda exchange, symbol, timeframe: {
+            "symbol": f"{exchange}:{symbol}",
+            "timeframe": timeframe,
+            "market_sentiment": {"buy_sell_signal": "BUY"},
+        },
+    )
+    monkeypatch.setattr(
+        stocks.provider,
+        "get_trade_score",
+        lambda exchange, symbol, timeframe: {
+            "symbol": f"{exchange}:{symbol}",
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "score": 83.33,
+            "score_source": "technical_rating",
+            "signal": "BUY",
+            "grade": None,
+            "trend_state": None,
+            "price_data": {},
+            "trade_setup": None,
+            "risk_reward": None,
+            "key_indicators": {},
+            "warnings": [],
+        },
+    )
+
+    quote = client.get("/api/v1/stocks/TSLA/quote?exchange=NYSE").json()
+    technicals = client.get("/api/v1/stocks/TSLA/technicals?timeframe=4h").json()
+    valuation = client.post("/api/v1/stocks/TSLA/valuation").json()
+    fundamentals = client.get("/api/v1/stocks/TSLA/fundamentals")
+
+    assert quote["exchange"] == "NYSE"
+    assert technicals["timeframe"] == "4h"
+    assert valuation["score"] == 83.33
+    assert valuation["score_source"] == "technical_rating"
+    assert fundamentals.status_code == 501
+    assert "Fundamentals are not supported" in fundamentals.json()["detail"]

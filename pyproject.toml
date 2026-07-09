@@ -1,16 +1,14 @@
 [project]
 name = "stock-api"
 version = "0.1.0"
-description = "FastAPI stock valuation API powered by yFinance."
+description = "FastAPI trading intelligence API powered by TradingView MCP."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "cachetools>=5.3.0",
     "fastapi>=0.111.0",
-    "pandas>=2.2.0",
     "pydantic-settings>=2.2.0",
+    "tradingview-mcp-server @ git+https://github.com/atilaahmettaner/tradingview-mcp.git@546dc2a2e65b6ea8083a3c45a689f6e399a1df08",
     "uvicorn[standard]>=0.30.0",
-    "yfinance>=0.2.40",
 ]
 
 [project.optional-dependencies]
@@ -30,5 +28,5 @@ include = ["app*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "live: tests that call live yFinance data and may be slow or network-dependent",
+    "live: tests that call live TradingView MCP data and may be slow or network-dependent",
 ]

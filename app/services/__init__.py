@@ -1,1 +1,1 @@
-"""External data and valuation services."""
+"""External market data and trading intelligence services."""
