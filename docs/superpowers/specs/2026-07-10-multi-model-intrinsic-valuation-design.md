@@ -162,12 +162,12 @@ If a component is unavailable, calculate the median from the remaining component
 
 ### Growth
 
-Derive base growth from per-share revenue and owner-earnings history. Reject non-finite values and cap base growth at 12%. Growth fades annually toward the scenario terminal rate over ten projection years.
+Derive base growth from per-share revenue and owner-earnings history. Reject non-finite values and clamp base growth between -15% and 12%. Growth fades annually toward the scenario terminal rate over ten projection years.
 
 | Scenario | Starting earnings | Initial growth | Required return | Terminal growth |
 | --- | ---: | ---: | ---: | ---: |
-| Bear | 90% of normalized | Base minus 4 percentage points, minimum 0% | 12% | 2% |
-| Base | 100% of normalized | Derived growth, maximum 12% | 10% | 2.5% |
+| Bear | 90% of normalized | Base minus 4 percentage points, minimum -20% | 12% | 2% |
+| Base | 100% of normalized | Derived growth, between -15% and 12% | 10% | 2.5% |
 | Bull | 105% of normalized | Base plus 3 percentage points, maximum 15% | 8% | 3% |
 
 Project and discount each annual owner-earnings amount. Calculate terminal value as `OE10 * (1 + terminal_growth) / (required_return - terminal_growth)` and discount it from year 10. Required return must be greater than terminal growth.
@@ -210,12 +210,12 @@ Normalize starting DPU by taking the median of:
 2. Weighted three-year DPU.
 3. Five-year median DPU.
 
-Require at least three usable distribution years. Derive base DPU growth from per-unit history and cap it at 3%. Cap NAV growth at 2.5%.
+Require at least three usable distribution years. Derive base DPU growth from per-unit history and clamp it between -3% and 3%. Derive base NAV growth from per-unit history and clamp it between -2% and 2.5%; bear and bull NAV growth move one percentage point below and above base within the same bounds.
 
 | Scenario | Starting DPU | DPU growth | Required return | Terminal NAV |
 | --- | ---: | ---: | ---: | ---: |
-| Bear | 90% of normalized | -1% | 10% | 85% of projected NAV |
-| Base | 100% of normalized | Derived growth, maximum 3% | 8.5% | 100% of projected NAV |
+| Bear | 90% of normalized | Base minus 2 percentage points, minimum -5% | 10% | 85% of projected NAV |
+| Base | 100% of normalized | Derived growth, between -3% and 3% | 8.5% | 100% of projected NAV |
 | Bull | 105% of normalized | Base plus 2 percentage points, maximum 5% | 7% | 110% of projected NAV |
 
 Return the present value contributed by distributions and terminal NAV separately. Supporting quality facts include aggregate leverage, interest coverage, occupancy, weighted average lease expiry, recurring property capex, and material currency exposure.
