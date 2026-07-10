@@ -334,7 +334,7 @@ def test_selects_latest_compatible_amendment_without_summing_duplicates(
         ),
         sec_fact(
             999,
-            start="2024-07-01",
+            start="2024-04-01",
             form="10-K/A",
             filed="2025-04-01",
             accession="incompatible-amendment",
@@ -541,6 +541,30 @@ def test_uses_ordered_concept_priority_before_newer_fallback(
     )
 
 
+def test_prefers_common_equity_over_broad_stockholders_equity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    facts = company_facts(
+        {
+            "CommonStockholdersEquity": {
+                "USD": [sec_fact(700, start=None)]
+            },
+            "StockholdersEquity": {
+                "USD": [sec_fact(1_000, start=None)]
+            },
+            "Revenues": {"USD": [sec_fact(500)]},
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    period = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL").periods[0]
+
+    assert period.common_equity == 700.0
+    assert period.sources["common_equity"].concept == "CommonStockholdersEquity"
+
+
 def test_returns_five_annual_periods_and_latest_four_compatible_quarters_as_ttm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -647,6 +671,75 @@ def test_does_not_build_ttm_from_nonconsecutive_quarter_frames(
             "Revenues": {
                 "USD": [sec_fact(500), *quarterly]
             }
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+
+    assert all(not period.is_ttm for period in result.periods)
+
+
+def test_does_not_union_sparse_quarters_across_unrelated_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    revenue_quarters = [
+        sec_fact(
+            10,
+            start="2025-01-01",
+            end="2025-03-31",
+            form="10-Q",
+            filed="2025-04-30",
+            accession="revenue-q1",
+            fiscal_year=2025,
+            fiscal_period="Q1",
+            frame="CY2025Q1",
+        ),
+        sec_fact(
+            20,
+            start="2025-04-01",
+            end="2025-06-30",
+            form="10-Q",
+            filed="2025-07-31",
+            accession="revenue-q2",
+            fiscal_year=2025,
+            fiscal_period="Q2",
+            frame="CY2025Q2",
+        ),
+    ]
+    operating_q3 = sec_fact(
+        30,
+        start="2025-07-01",
+        end="2025-09-30",
+        form="10-Q",
+        filed="2025-10-31",
+        accession="operating-q3",
+        fiscal_year=2025,
+        fiscal_period="Q3",
+        frame="CY2025Q3",
+    )
+    equity_q4 = sec_fact(
+        700,
+        start=None,
+        end="2025-12-31",
+        form="10-K",
+        filed="2026-02-01",
+        accession="equity-q4",
+        fiscal_year=2025,
+        fiscal_period="Q4",
+        frame="CY2025Q4I",
+    )
+    facts = company_facts(
+        {
+            "Revenues": {
+                "USD": [sec_fact(500), *revenue_quarters]
+            },
+            "NetCashProvidedByUsedInOperatingActivities": {
+                "USD": [operating_q3]
+            },
+            "CommonStockholdersEquity": {"USD": [equity_q4]},
         }
     )
     install_fetch_payloads(monkeypatch, facts)

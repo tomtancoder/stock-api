@@ -69,8 +69,8 @@ _CONCEPTS: dict[str, tuple[str, ...]] = {
         "NetIncomeLoss",
     ),
     "common_equity": (
-        "StockholdersEquity",
         "CommonStockholdersEquity",
+        "StockholdersEquity",
     ),
     "cash_and_equivalents": (
         "CashAndCashEquivalentsAtCarryingValue",
@@ -125,6 +125,14 @@ class _SecFact:
     fiscal_year: int | None
     fiscal_period: str | None
     frame: str | None
+
+
+@dataclass(frozen=True)
+class _TtmWindow:
+    facts: tuple[_SecFact, _SecFact, _SecFact, _SecFact]
+    final_frame_index: int
+    field_priority: int
+    concept_priority: int
 
 
 def resolve_cik(symbol: str) -> str:
@@ -270,7 +278,7 @@ def _build_annual_periods(
         fiscal_years: list[int] = []
         for field, concept_names in _CONCEPTS.items():
             selected = _select_for_period(
-                candidates[field], concept_names, period_end
+                candidates[field], concept_names, period_end, field
             )
             if selected is None:
                 continue
@@ -312,8 +320,8 @@ def _build_ttm_period(
         }
         for field, concept_names in _CONCEPTS.items()
     }
-    frame_run = _latest_four_quarter_run(all_quarters)
-    if frame_run is None:
+    window = _latest_ttm_window(all_quarters)
+    if window is None:
         return None
 
     values: dict[str, Any] = {
@@ -322,11 +330,10 @@ def _build_ttm_period(
         "currency": currency,
     }
     sources: dict[str, FactProvenance] = {}
-    selected_facts: list[_SecFact] = []
     for field, concept_names in _CONCEPTS.items():
         if field in _ADDITIVE_FIELDS or field == "interest_paid_outside_operating":
             facts = _select_same_concept_quarters(
-                all_quarters[field], concept_names, frame_run
+                all_quarters[field], concept_names, window.facts
             )
             if facts is None:
                 continue
@@ -336,80 +343,129 @@ def _build_ttm_period(
                 if field == "interest_paid_outside_operating"
                 else sum(fact.value for fact in facts)
             )
-        else:
-            selected = _select_latest_quarter(
-                all_quarters[field], concept_names, frame_run[-1]
+        elif field == "diluted_shares":
+            selected = _select_duration_at_window_end(
+                all_quarters[field], concept_names, window.facts[-1]
             )
             if selected is None:
                 continue
             values[field] = selected.value
-        selected_facts.append(selected)
+        else:
+            selected = _select_instant_at_window_end(
+                all_quarters[field], concept_names, window.facts[-1].end
+            )
+            if selected is None:
+                continue
+            values[field] = selected.value
         sources[field] = _provenance(selected)
 
     if not sources:
         return None
-    values["period_end"] = max(fact.end for fact in selected_facts)
+    values["period_end"] = window.facts[-1].end
     values["sources"] = sources
     return FinancialPeriod(**values)
 
 
-def _latest_four_quarter_run(
+def _latest_ttm_window(
     all_quarters: Mapping[str, Mapping[str, list[_SecFact]]],
-) -> tuple[int, int, int, int] | None:
-    indices = sorted(
-        {
-            index
-            for concepts_by_name in all_quarters.values()
-            for facts in concepts_by_name.values()
-            for fact in facts
-            if (index := _frame_index(fact.frame)) is not None
-        }
+) -> _TtmWindow | None:
+    candidates: list[_TtmWindow] = []
+    for field_priority, (field, concept_names) in enumerate(_CONCEPTS.items()):
+        if field in _INSTANT_FIELDS:
+            continue
+        for concept_priority, concept in enumerate(concept_names):
+            by_frame: dict[int, list[_SecFact]] = {}
+            for fact in all_quarters[field][concept]:
+                frame_index = _frame_index(fact.frame)
+                if frame_index is not None:
+                    by_frame.setdefault(frame_index, []).append(fact)
+            observations = {
+                frame_index: _latest_compatible_duration_fact(facts)
+                for frame_index, facts in by_frame.items()
+            }
+            frame_indices = sorted(observations)
+            for position in range(len(frame_indices) - 3):
+                run = frame_indices[position : position + 4]
+                if any(right != left + 1 for left, right in zip(run, run[1:])):
+                    continue
+                facts = tuple(observations[index] for index in run)
+                if not _coherent_quarter_window(facts):
+                    continue
+                candidates.append(
+                    _TtmWindow(
+                        facts=facts,
+                        final_frame_index=run[-1],
+                        field_priority=field_priority,
+                        concept_priority=concept_priority,
+                    )
+                )
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda window: (
+            window.facts[-1].end,
+            window.final_frame_index,
+            -window.field_priority,
+            -window.concept_priority,
+        ),
     )
-    run: list[int] = []
-    latest: tuple[int, int, int, int] | None = None
-    for index in indices:
-        if run and index != run[-1] + 1:
-            run = []
-        run.append(index)
-        if len(run) >= 4:
-            latest = tuple(run[-4:])  # type: ignore[assignment]
-    return latest
+
+
+def _coherent_quarter_window(
+    facts: tuple[_SecFact, _SecFact, _SecFact, _SecFact],
+) -> bool:
+    if any(fact.start is None for fact in facts):
+        return False
+    for previous, current in zip(facts, facts[1:]):
+        assert previous.start is not None
+        assert current.start is not None
+        gap_days = (current.start - previous.end).days
+        if not 1 <= gap_days <= 35 or current.end <= previous.end:
+            return False
+    assert facts[0].start is not None
+    return 300 <= (facts[-1].end - facts[0].start).days <= 400
 
 
 def _select_same_concept_quarters(
     concepts_by_name: Mapping[str, list[_SecFact]],
     concept_names: tuple[str, ...],
-    frame_run: tuple[int, int, int, int],
+    window_facts: tuple[_SecFact, _SecFact, _SecFact, _SecFact],
 ) -> list[_SecFact] | None:
     for concept in concept_names:
-        by_frame: dict[int, list[_SecFact]] = {}
-        for fact in concepts_by_name[concept]:
-            index = _frame_index(fact.frame)
-            if index is not None:
-                by_frame.setdefault(index, []).append(fact)
-        if not all(index in by_frame for index in frame_run):
+        selected: list[_SecFact] = []
+        for window_fact in window_facts:
+            candidates = [
+                fact
+                for fact in concepts_by_name[concept]
+                if fact.start == window_fact.start and fact.end == window_fact.end
+            ]
+            if not candidates:
+                break
+            selected.append(_latest_compatible_duration_fact(candidates))
+        if len(selected) != 4:
             continue
-        return [_latest_fact(by_frame[index]) for index in frame_run]
+        return selected
     return None
 
 
-def _select_latest_quarter(
+def _select_duration_at_window_end(
     concepts_by_name: Mapping[str, list[_SecFact]],
     concept_names: tuple[str, ...],
-    frame_index: int,
+    window_fact: _SecFact,
 ) -> _SecFact | None:
     for concept in concept_names:
         candidates = [
             fact
             for fact in concepts_by_name[concept]
-            if _frame_index(fact.frame) == frame_index
+            if fact.start == window_fact.start and fact.end == window_fact.end
         ]
         if candidates:
-            return _latest_fact(candidates)
+            return _latest_compatible_duration_fact(candidates)
     return None
 
 
-def _select_for_period(
+def _select_instant_at_window_end(
     concepts_by_name: Mapping[str, list[_SecFact]],
     concept_names: tuple[str, ...],
     period_end: date,
@@ -423,6 +479,46 @@ def _select_for_period(
         if candidates:
             return _latest_fact(candidates)
     return None
+
+
+def _select_for_period(
+    concepts_by_name: Mapping[str, list[_SecFact]],
+    concept_names: tuple[str, ...],
+    period_end: date,
+    field: str,
+) -> _SecFact | None:
+    for concept in concept_names:
+        candidates = [
+            fact
+            for fact in concepts_by_name[concept]
+            if fact.end == period_end
+        ]
+        if candidates:
+            return _latest_compatible_annual_fact(candidates, field)
+    return None
+
+
+def _latest_compatible_annual_fact(
+    candidates: list[_SecFact], field: str
+) -> _SecFact:
+    if field in _INSTANT_FIELDS:
+        return _latest_fact(candidates)
+    return _latest_compatible_duration_fact(candidates)
+
+
+def _latest_compatible_duration_fact(
+    candidates: list[_SecFact],
+) -> _SecFact:
+    originals = [fact for fact in candidates if not fact.form.endswith("/A")]
+    if not originals:
+        return _latest_fact(candidates)
+    original = _latest_fact(originals)
+    compatible = [
+        fact
+        for fact in candidates
+        if fact.start == original.start and fact.end == original.end
+    ]
+    return _latest_fact(compatible)
 
 
 def _latest_fact(candidates: list[_SecFact]) -> _SecFact:
