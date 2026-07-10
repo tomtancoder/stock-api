@@ -317,34 +317,41 @@ The analysis response is calculated locally from yfinance OHLCV history and can 
 ### TradingView MCP Technical Analysis
 
 ```http
-GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D
+GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D&include_multi_timeframe=false
 ```
 
-The technical endpoint returns TradingView MCP single-symbol technical analysis. It can include the provider's indicator objects, market sentiment, `stock_score` when available, and trade setup fields when available.
+The technical endpoint returns TradingView MCP single-symbol technical analysis. It can include the provider's indicator objects, market sentiment, `stock_score` when available, and trade setup fields when available. A second cached TradingView scanner lookup supplies trailing P/E and 52-week high/low; `/technical` does not use yFinance.
 
 Query parameters:
 
 | Name | Required | Default | Description |
 | --- | --- | --- | --- |
 | `timeframe` | no | `1D` | Analysis timeframe |
+| `include_multi_timeframe` | no | `false` | Add fixed 1W, 1D, 4h, 1h, and 15m alignment analysis |
 
 Example:
 
 ```bash
-curl "http://127.0.0.1:8000/api/v1/markets/TVC/XAUUSD/technical?timeframe=1D"
+curl "http://127.0.0.1:8000/api/v1/markets/NASDAQ/TSLA/technical?timeframe=1D&include_multi_timeframe=true"
 ```
 
 Example response shape:
 
 ```json
 {
-  "symbol": "TVC:GOLD",
-  "exchange": "TVC",
+  "symbol": "NASDAQ:TSLA",
+  "exchange": "NASDAQ",
   "timeframe": "1D",
   "timestamp": "real-time",
   "source": "tradingview_mcp",
   "price_data": {
-    "current_price": 4114.67
+    "current_price": 428.11,
+    "fifty_two_week_high": 555.45,
+    "fifty_two_week_low": 349.2
+  },
+  "valuation_metrics": {
+    "trailing_pe": 65.2,
+    "primary_pe": "trailing"
   },
   "market_sentiment": {
     "overall_rating": 0,
@@ -363,11 +370,33 @@ Example response shape:
   "trend_state": "bullish",
   "trade_setup": {
     "risk_reward": 2.4
+  },
+  "warnings": [],
+  "multi_timeframe": {
+    "analysis_type": "Multi-Timeframe Alignment",
+    "timeframes": {
+      "1W": {"bias": "Bullish"},
+      "1D": {"bias": "Bullish"},
+      "4h": {"bias": "Bullish"},
+      "1h": {"bias": "Neutral"},
+      "15m": {"bias": "Bullish"}
+    },
+    "alignment": {
+      "status": "MOSTLY BULLISH",
+      "confidence": "High"
+    },
+    "recommendation": {
+      "action": "BUY"
+    }
   }
 }
 ```
 
-Client applications should treat indicator objects as provider-shaped dictionaries and read only the fields they need.
+Client applications should treat indicator objects as provider-shaped dictionaries and read only the fields they need. `valuation_metrics.trailing_pe` is TradingView's trailing-twelve-month P/E; non-positive, non-finite, or unavailable values are returned as `null`. The 52-week fields are also nullable. Reference lookup failure does not fail the primary analysis and instead adds a warning.
+
+`include_multi_timeframe=true` performs a fixed 1W → 1D → 4h → 1h → 15m alignment analysis. It is independent of the primary `timeframe` parameter. Partial or complete multi-timeframe failure preserves the primary response, keeps available timeframe results and errors under `multi_timeframe`, and adds a warning.
+
+TradingView's internal bulk scanner can reduce upstream calls for candidate lists, but its raw rows do not match this advanced response: they omit the stock score, trade setup and quality, ATR augmentation, normalized reference fields, and multi-timeframe processing. No bulk `/technical` endpoint is exposed.
 
 ## Screeners
 
@@ -615,7 +644,7 @@ These routes are kept for compatibility with older clients. New applications sho
 | Method | Endpoint | Replacement |
 | --- | --- | --- |
 | `GET` | `/api/v1/stocks/{symbol}/quote?exchange=NASDAQ` | `/api/v1/markets/{exchange}/{symbol}/quote` |
-| `GET` | `/api/v1/stocks/{symbol}/technicals?exchange=NASDAQ&timeframe=1D` | `/api/v1/markets/{exchange}/{symbol}/technical` |
+| `GET` | `/api/v1/stocks/{symbol}/technicals?exchange=NASDAQ&timeframe=1D&include_multi_timeframe=false` | `/api/v1/markets/{exchange}/{symbol}/technical` |
 | `POST` | `/api/v1/stocks/{symbol}/valuation?exchange=NASDAQ&timeframe=1D` | Not supported |
 | `GET` | `/api/v1/stocks/{symbol}/fundamentals` | Not supported |
 
@@ -686,9 +715,14 @@ async function apiPost(path, body) {
   return response.json();
 }
 
-export async function getTechnicalAnalysis(exchange, symbol, timeframe = "1D") {
+export async function getTechnicalAnalysis(
+  exchange,
+  symbol,
+  timeframe = "1D",
+  includeMultiTimeframe = false
+) {
   return apiGet(
-    `/api/v1/markets/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}/technical?timeframe=${encodeURIComponent(timeframe)}`
+    `/api/v1/markets/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}/technical?timeframe=${encodeURIComponent(timeframe)}&include_multi_timeframe=${includeMultiTimeframe}`
   );
 }
 

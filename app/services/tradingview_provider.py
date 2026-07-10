@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Callable
 
@@ -53,11 +54,26 @@ try:  # pragma: no cover
         analyze_coin,
         fetch_bollinger_analysis,
         fetch_trending_analysis,
+        run_multi_timeframe_analysis as _run_multi_timeframe_analysis,
     )
 except Exception:  # pragma: no cover
     analyze_coin = _missing_dependency
     fetch_bollinger_analysis = _missing_dependency
     fetch_trending_analysis = _missing_dependency
+    _run_multi_timeframe_analysis = _missing_dependency
+
+try:  # pragma: no cover
+    from tradingview_mcp.core.services.screener_provider import _scan_with_retry
+    from tradingview_mcp.core.utils.validators import (
+        normalize_tradingview_symbol,
+        resolve_screener_for_symbol,
+    )
+    from tradingview_screener import Query
+except Exception:  # pragma: no cover
+    _scan_with_retry = _missing_dependency
+    normalize_tradingview_symbol = _missing_dependency
+    resolve_screener_for_symbol = _missing_dependency
+    Query = None
 
 try:  # pragma: no cover
     from tradingview_mcp.core.services.backtest_service import (
@@ -119,16 +135,103 @@ def get_analysis(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
     return _with_public_timeframe(payload, normalized_timeframe)
 
 
-def get_technical_analysis(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
+def get_technical_analysis(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    include_multi_timeframe: bool = False,
+) -> dict[str, Any]:
     normalized_timeframe = _normalize_timeframe(timeframe)
+    normalized_exchange = _normalize_exchange(exchange)
     payload = analyze_coin(
         _analysis_symbol(exchange, symbol),
-        _normalize_exchange(exchange),
+        normalized_exchange,
         normalized_timeframe,
     )
     _raise_if_error(payload)
     response = _with_public_timeframe(_plain_dict(payload), normalized_timeframe)
-    return {**response, "source": "tradingview_mcp"}
+    warnings = list(response.get("warnings") or [])
+
+    try:
+        reference_data = _get_tradingview_reference_data(exchange, symbol)
+    except Exception:  # noqa: BLE001 - reference data must not block core TA.
+        reference_data = {
+            "trailing_pe": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+        }
+        warnings.append("TradingView reference data is temporarily unavailable.")
+
+    price_data = response.get("price_data")
+    if not isinstance(price_data, dict):
+        price_data = {}
+
+    response = {
+        **response,
+        "price_data": {
+            **price_data,
+            "fifty_two_week_high": reference_data["fifty_two_week_high"],
+            "fifty_two_week_low": reference_data["fifty_two_week_low"],
+        },
+        "valuation_metrics": {
+            "trailing_pe": reference_data["trailing_pe"],
+            "primary_pe": "trailing",
+        },
+        "source": "tradingview_mcp",
+        "warnings": warnings,
+    }
+
+    if include_multi_timeframe:
+        full_symbol = _tradingview_symbol(exchange, symbol)
+        try:
+            multi_timeframe = _plain_dict(
+                _run_multi_timeframe_analysis(full_symbol, normalized_exchange)
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the base TA response.
+            multi_timeframe = {
+                "error": {
+                    "code": "UPSTREAM_ERROR",
+                    "message": f"Multi-timeframe analysis failed: {exc}",
+                    "retryable": True,
+                }
+            }
+        response["multi_timeframe"] = multi_timeframe
+        if _multi_timeframe_is_incomplete(multi_timeframe):
+            warnings.append("TradingView multi-timeframe analysis is incomplete.")
+
+    return response
+
+
+def _get_tradingview_reference_data(exchange: str, symbol: str) -> dict[str, float | None]:
+    if Query is None:
+        _missing_dependency()
+
+    full_symbol = _tradingview_symbol(exchange, symbol)
+    normalized_exchange = _normalize_exchange(exchange)
+    screener = resolve_screener_for_symbol(full_symbol, normalized_exchange)
+    query = (
+        Query()
+        .select(
+            "price_earnings_ttm",
+            "price_52_week_high",
+            "price_52_week_low",
+        )
+        .set_tickers(full_symbol)
+        .set_markets(screener)
+    )
+    _, rows = _scan_with_retry(
+        query,
+        cache_key=("technical_reference_v1", screener, full_symbol),
+    )
+    if rows.empty:
+        raise LookupError(f"No TradingView reference data found for {full_symbol}.")
+
+    row = rows.iloc[0]
+    return {
+        "trailing_pe": _positive_float(row.get("price_earnings_ttm")),
+        "fifty_two_week_high": _finite_float(row.get("price_52_week_high")),
+        "fifty_two_week_low": _finite_float(row.get("price_52_week_low")),
+    }
 
 
 def get_gainers(exchange: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
@@ -319,6 +422,13 @@ def _analysis_symbol(exchange: str, symbol: str) -> str:
     return normalized_symbol
 
 
+def _tradingview_symbol(exchange: str, symbol: str) -> str:
+    return normalize_tradingview_symbol(
+        _analysis_symbol(exchange, symbol),
+        _normalize_exchange(exchange),
+    )
+
+
 def _normalize_exchange(exchange: str) -> str:
     return exchange.strip().upper()
 
@@ -366,3 +476,30 @@ def _retry_after_s(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return seconds if seconds > 0 else None
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _positive_float(value: Any) -> float | None:
+    number = _finite_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _multi_timeframe_is_incomplete(payload: Any) -> bool:
+    if not isinstance(payload, dict) or "error" in payload:
+        return True
+    timeframes = payload.get("timeframes")
+    if not isinstance(timeframes, dict) or not timeframes:
+        return True
+    return any(
+        isinstance(result, dict) and "error" in result
+        for result in timeframes.values()
+    )

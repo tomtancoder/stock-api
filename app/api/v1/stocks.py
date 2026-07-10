@@ -34,12 +34,14 @@ def technicals(
     symbol: str = Path(..., min_length=1, max_length=64),
     exchange: str | None = Query(default=None, min_length=1, max_length=32),
     timeframe: str | None = Query(default=None, min_length=1, max_length=16),
+    include_multi_timeframe: bool = Query(default=False),
 ) -> dict[str, Any]:
     return _provider_response(
         provider.get_technical_analysis,
         exchange or get_settings().default_exchange,
         symbol,
         timeframe or get_settings().default_timeframe,
+        include_multi_timeframe,
     )
 
 

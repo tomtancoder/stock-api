@@ -110,15 +110,31 @@ def test_market_analysis_retryable_error_returns_retry_after_header(monkeypatch)
 def test_market_technical_endpoint_returns_tradingview_mcp_analysis(monkeypatch):
     from app.api.v1 import markets
 
-    def fake_technical(exchange: str, symbol: str, timeframe: str):
-        assert (exchange, symbol, timeframe) == ("NASDAQ", "TSLA", "1D")
+    def fake_technical(
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        include_multi_timeframe: bool,
+    ):
+        assert (exchange, symbol, timeframe, include_multi_timeframe) == (
+            "NASDAQ",
+            "TSLA",
+            "1D",
+            False,
+        )
         return {
             "symbol": "NASDAQ:TSLA",
             "exchange": "NASDAQ",
             "timeframe": "1D",
             "source": "tradingview_mcp",
             "timestamp": "real-time",
-            "price_data": {"current_price": 428.11},
+            "price_data": {
+                "current_price": 428.11,
+                "fifty_two_week_high": 555.45,
+                "fifty_two_week_low": 349.2,
+            },
+            "valuation_metrics": {"trailing_pe": 65.2, "primary_pe": "trailing"},
+            "warnings": [],
             "market_sentiment": {"overall_rating": 2, "buy_sell_signal": "BUY"},
             "stock_score": 87,
             "grade": "A",
@@ -137,6 +153,47 @@ def test_market_technical_endpoint_returns_tradingview_mcp_analysis(monkeypatch)
     assert payload["stock_score"] == 87
     assert payload["market_sentiment"]["buy_sell_signal"] == "BUY"
     assert payload["trade_setup"]["risk_reward"] == 2.4
+    assert payload["price_data"]["fifty_two_week_high"] == 555.45
+    assert payload["valuation_metrics"]["trailing_pe"] == 65.2
+    assert payload["warnings"] == []
+    assert "multi_timeframe" not in payload
+
+
+def test_market_technical_endpoint_can_request_multi_timeframe(monkeypatch):
+    from app.api.v1 import markets
+
+    def fake_technical(exchange, symbol, timeframe, include_multi_timeframe):
+        assert (exchange, symbol, timeframe, include_multi_timeframe) == (
+            "NASDAQ",
+            "TSLA",
+            "4h",
+            True,
+        )
+        return {
+            "symbol": "NASDAQ:TSLA",
+            "timeframe": "4h",
+            "source": "tradingview_mcp",
+            "price_data": {
+                "current_price": 428.11,
+                "fifty_two_week_high": 555.45,
+                "fifty_two_week_low": 349.2,
+            },
+            "valuation_metrics": {"trailing_pe": 65.2, "primary_pe": "trailing"},
+            "warnings": [],
+            "multi_timeframe": {
+                "alignment": {"status": "MOSTLY BULLISH", "confidence": "High"}
+            },
+        }
+
+    monkeypatch.setattr(markets.provider, "get_technical_analysis", fake_technical)
+
+    response = client.get(
+        "/api/v1/markets/NASDAQ/TSLA/technical"
+        "?timeframe=4h&include_multi_timeframe=true"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["multi_timeframe"]["alignment"]["confidence"] == "High"
 
 
 def test_market_score_endpoint_is_removed():
@@ -325,25 +382,45 @@ def test_stock_routes_remain_compatibility_aliases(monkeypatch):
             "warnings": [],
         },
     )
+    technical_calls = []
     monkeypatch.setattr(
         stocks.provider,
         "get_technical_analysis",
-        lambda exchange, symbol, timeframe: {
+        lambda exchange, symbol, timeframe, include_multi_timeframe: technical_calls.append(
+            (exchange, symbol, timeframe, include_multi_timeframe)
+        )
+        or {
             "symbol": f"{exchange}:{symbol}",
             "timeframe": timeframe,
             "source": "tradingview_mcp",
             "market_sentiment": {"buy_sell_signal": "BUY"},
+            "price_data": {
+                "fifty_two_week_high": 555.45,
+                "fifty_two_week_low": 349.2,
+            },
+            "valuation_metrics": {"trailing_pe": 65.2, "primary_pe": "trailing"},
+            "warnings": [],
+            **(
+                {"multi_timeframe": {"alignment": {"status": "MOSTLY BULLISH"}}}
+                if include_multi_timeframe
+                else {}
+            ),
         },
     )
 
     quote = client.get("/api/v1/stocks/TSLA/quote?exchange=NYSE").json()
-    technicals = client.get("/api/v1/stocks/TSLA/technicals?timeframe=4h").json()
+    technicals = client.get(
+        "/api/v1/stocks/TSLA/technicals?timeframe=4h&include_multi_timeframe=true"
+    ).json()
     valuation = client.post("/api/v1/stocks/TSLA/valuation")
     fundamentals = client.get("/api/v1/stocks/TSLA/fundamentals")
 
     assert quote["exchange"] == "NYSE"
     assert technicals["timeframe"] == "4h"
     assert technicals["source"] == "tradingview_mcp"
+    assert technicals["valuation_metrics"]["trailing_pe"] == 65.2
+    assert technicals["multi_timeframe"]["alignment"]["status"] == "MOSTLY BULLISH"
+    assert technical_calls == [("NASDAQ", "TSLA", "4h", True)]
     assert valuation.status_code == 501
     assert "Valuation is not supported" in valuation.json()["detail"]
     assert fundamentals.status_code == 501

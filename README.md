@@ -25,7 +25,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /health`
 - `GET /api/v1/markets/{exchange}/{symbol}/quote`
 - `GET /api/v1/markets/{exchange}/{symbol}/analysis?timeframe=1D`
-- `GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D`
+- `GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D&include_multi_timeframe=false`
 - `GET /api/v1/markets/{exchange}/gainers`
 - `GET /api/v1/markets/{exchange}/losers`
 - `GET /api/v1/markets/{exchange}/bollinger-scan`
@@ -46,7 +46,7 @@ Legacy stock routes remain as compatibility aliases:
 
 Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
 Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
-Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available.
+Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available. A cached TradingView scanner lookup also adds trailing P/E and 52-week high/low. These reference fields are nullable and do not make `/technical` depend on yFinance.
 
 ## Markets
 
@@ -70,6 +70,10 @@ yfinance-backed quote, analysis, and backtest data resolves this to `GC=F`. Trad
 ## Technical Analysis
 
 `/technical` returns the TradingView MCP technical analysis payload for one symbol. Client applications should treat indicator objects as provider-shaped dictionaries and read only the fields they need.
+
+Set `include_multi_timeframe=true` to add TradingView MCP alignment analysis for the fixed `1W`, `1D`, `4h`, `1h`, and `15m` timeframes. The normal `timeframe` parameter continues to control the primary single-timeframe analysis only. Reference-data or multi-timeframe failures preserve the primary technical response and are reported through nullable fields, nested per-timeframe errors, and `warnings`.
+
+TradingView's internal bulk scanner is useful for candidate lists because it fetches multiple symbols in fewer upstream calls, but its raw rows are not equivalent to `/technical`: they do not include the endpoint's stock score, trade setup and quality, ATR augmentation, normalized reference fields, or optional multi-timeframe analysis. This API therefore does not expose a bulk `/technical` route.
 
 ## Configuration
 

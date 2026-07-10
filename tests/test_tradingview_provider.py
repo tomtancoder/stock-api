@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 
@@ -5,6 +6,7 @@ def test_technical_analysis_uses_tradingview_mcp_analyze_coin(monkeypatch):
     from app.services import tradingview_provider as provider
 
     calls = []
+    multi_timeframe_calls = []
 
     monkeypatch.setattr(
         provider,
@@ -28,6 +30,27 @@ def test_technical_analysis_uses_tradingview_mcp_analyze_coin(monkeypatch):
             "atr": {"value": 12.2},
         },
     )
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: {
+            "trailing_pe": 38.25,
+            "fifty_two_week_high": 555.45,
+            "fifty_two_week_low": 349.2,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider,
+        "get_yfinance_analysis",
+        lambda *args: pytest.fail("/technical must not use yFinance analysis"),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_run_multi_timeframe_analysis",
+        lambda *args: multi_timeframe_calls.append(args),
+        raising=False,
+    )
 
     response = provider.get_technical_analysis("NASDAQ", "TSLA", "1d")
 
@@ -39,6 +62,15 @@ def test_technical_analysis_uses_tradingview_mcp_analyze_coin(monkeypatch):
     assert response["grade"] == "A"
     assert response["trade_setup"]["risk_reward"] == 2.4
     assert response["rsi"]["value"] == 61.2
+    assert response["price_data"]["fifty_two_week_high"] == 555.45
+    assert response["price_data"]["fifty_two_week_low"] == 349.2
+    assert response["valuation_metrics"] == {
+        "trailing_pe": 38.25,
+        "primary_pe": "trailing",
+    }
+    assert response["warnings"] == []
+    assert "multi_timeframe" not in response
+    assert multi_timeframe_calls == []
 
 
 def test_technical_analysis_strips_sgx_yahoo_suffix(monkeypatch):
@@ -56,6 +88,16 @@ def test_technical_analysis_strips_sgx_yahoo_suffix(monkeypatch):
         }
 
     monkeypatch.setattr(provider, "analyze_coin", fake_analyze_coin)
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: {
+            "trailing_pe": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+        },
+        raising=False,
+    )
 
     response = provider.get_technical_analysis("SGX", "D05.SI", "1D")
 
@@ -63,6 +105,268 @@ def test_technical_analysis_strips_sgx_yahoo_suffix(monkeypatch):
     assert response["symbol"] == "SGX:D05"
     assert response["timeframe"] == "1D"
     assert response["source"] == "tradingview_mcp"
+
+
+@pytest.mark.parametrize(
+    ("exchange", "symbol", "expected"),
+    [
+        ("SGX", "D05.SI", "SGX:D05"),
+        ("TVC", "XAUUSD", "TVC:GOLD"),
+    ],
+)
+def test_tradingview_symbol_normalizes_provider_aliases(exchange, symbol, expected):
+    from app.services import tradingview_provider as provider
+
+    assert provider._tradingview_symbol(exchange, symbol) == expected
+
+
+def test_tradingview_reference_data_uses_scanner_fields_and_normalized_symbol(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    captured = {}
+
+    def fake_scan(query, cache_key):
+        captured["query"] = query.query
+        captured["cache_key"] = cache_key
+        return 1, pd.DataFrame(
+            [
+                {
+                    "ticker": "NASDAQ:AAPL",
+                    "price_earnings_ttm": 38.2531905885,
+                    "price_52_week_high": 317.4,
+                    "price_52_week_low": 201.5,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(provider, "_scan_with_retry", fake_scan, raising=False)
+
+    response = provider._get_tradingview_reference_data("NASDAQ", "AAPL")
+
+    assert captured["query"]["markets"] == ["america"]
+    assert captured["query"]["symbols"]["tickers"] == ["NASDAQ:AAPL"]
+    assert captured["query"]["columns"] == [
+        "price_earnings_ttm",
+        "price_52_week_high",
+        "price_52_week_low",
+    ]
+    assert captured["cache_key"] == (
+        "technical_reference_v1",
+        "america",
+        "NASDAQ:AAPL",
+    )
+    assert response == {
+        "trailing_pe": 38.2531905885,
+        "fifty_two_week_high": 317.4,
+        "fifty_two_week_low": 201.5,
+    }
+
+
+@pytest.mark.parametrize("invalid_pe", [None, 0, -10, float("nan"), float("inf")])
+def test_tradingview_reference_data_normalizes_invalid_pe(monkeypatch, invalid_pe):
+    from app.services import tradingview_provider as provider
+
+    monkeypatch.setattr(
+        provider,
+        "_scan_with_retry",
+        lambda query, cache_key: (
+            1,
+            pd.DataFrame(
+                [
+                    {
+                        "ticker": "NASDAQ:LOSS",
+                        "price_earnings_ttm": invalid_pe,
+                        "price_52_week_high": float("nan"),
+                        "price_52_week_low": None,
+                    }
+                ]
+            ),
+        ),
+        raising=False,
+    )
+
+    response = provider._get_tradingview_reference_data("NASDAQ", "LOSS")
+
+    assert response == {
+        "trailing_pe": None,
+        "fifty_two_week_high": None,
+        "fifty_two_week_low": None,
+    }
+
+
+def test_technical_analysis_preserves_base_result_when_reference_lookup_fails(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    monkeypatch.setattr(
+        provider,
+        "analyze_coin",
+        lambda symbol, exchange, timeframe: {
+            "symbol": "NASDAQ:TSLA",
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "price_data": {"current_price": 428.11},
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: (_ for _ in ()).throw(RuntimeError("scanner unavailable")),
+        raising=False,
+    )
+
+    response = provider.get_technical_analysis("NASDAQ", "TSLA", "1D")
+
+    assert response["price_data"] == {
+        "current_price": 428.11,
+        "fifty_two_week_high": None,
+        "fifty_two_week_low": None,
+    }
+    assert response["valuation_metrics"] == {
+        "trailing_pe": None,
+        "primary_pe": "trailing",
+    }
+    assert response["warnings"] == [
+        "TradingView reference data is temporarily unavailable."
+    ]
+
+
+def test_technical_analysis_adds_requested_multi_timeframe_result(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    calls = []
+    multi_timeframe = {
+        "analysis_type": "Multi-Timeframe Alignment",
+        "timeframes": {
+            "1W": {"bias": "Bullish"},
+            "1D": {"bias": "Bullish"},
+            "4h": {"bias": "Bullish"},
+            "1h": {"bias": "Neutral"},
+            "15m": {"bias": "Bullish"},
+        },
+        "alignment": {"status": "MOSTLY BULLISH", "confidence": "High"},
+        "recommendation": {"action": "BUY"},
+    }
+    monkeypatch.setattr(
+        provider,
+        "analyze_coin",
+        lambda symbol, exchange, timeframe: {
+            "symbol": "TVC:GOLD",
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "price_data": {"current_price": 4114.67},
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: {
+            "trailing_pe": None,
+            "fifty_two_week_high": 4200.0,
+            "fifty_two_week_low": 2500.0,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_run_multi_timeframe_analysis",
+        lambda symbol, exchange: calls.append((symbol, exchange)) or multi_timeframe,
+        raising=False,
+    )
+
+    response = provider.get_technical_analysis("TVC", "XAUUSD", "1D", True)
+
+    assert calls == [("TVC:GOLD", "TVC")]
+    assert response["multi_timeframe"] == multi_timeframe
+    assert response["warnings"] == []
+
+
+def test_technical_analysis_preserves_partial_multi_timeframe_result(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    partial = {
+        "timeframes": {
+            "1W": {"bias": "Bullish"},
+            "1D": {"error": "No data for 1D"},
+        },
+        "alignment": {"status": "LEAN BULLISH"},
+    }
+    monkeypatch.setattr(
+        provider,
+        "analyze_coin",
+        lambda symbol, exchange, timeframe: {
+            "symbol": "SGX:D05",
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "price_data": {"current_price": 70.02},
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: {
+            "trailing_pe": 12.1,
+            "fifty_two_week_high": 76.8,
+            "fifty_two_week_low": 58.4,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_run_multi_timeframe_analysis",
+        lambda symbol, exchange: partial,
+        raising=False,
+    )
+
+    response = provider.get_technical_analysis("SGX", "D05.SI", "1D", True)
+
+    assert response["multi_timeframe"] == partial
+    assert response["warnings"] == [
+        "TradingView multi-timeframe analysis is incomplete."
+    ]
+
+
+def test_technical_analysis_preserves_base_result_when_multi_timeframe_raises(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    monkeypatch.setattr(
+        provider,
+        "analyze_coin",
+        lambda symbol, exchange, timeframe: {
+            "symbol": "NASDAQ:TSLA",
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "price_data": {"current_price": 428.11},
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_tradingview_reference_data",
+        lambda exchange, symbol: {
+            "trailing_pe": 65.2,
+            "fifty_two_week_high": 555.45,
+            "fifty_two_week_low": 349.2,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_run_multi_timeframe_analysis",
+        lambda symbol, exchange: (_ for _ in ()).throw(RuntimeError("upstream timeout")),
+        raising=False,
+    )
+
+    response = provider.get_technical_analysis("NASDAQ", "TSLA", "1D", True)
+
+    assert response["multi_timeframe"] == {
+        "error": {
+            "code": "UPSTREAM_ERROR",
+            "message": "Multi-timeframe analysis failed: upstream timeout",
+            "retryable": True,
+        }
+    }
+    assert response["warnings"] == [
+        "TradingView multi-timeframe analysis is incomplete."
+    ]
 
 
 def test_technical_analysis_raises_provider_error_for_error_envelope(monkeypatch):
