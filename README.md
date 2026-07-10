@@ -1,6 +1,6 @@
 # Trading Intelligence API
 
-FastAPI API for market quotes, owner-earnings intrinsic valuation, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.
+FastAPI API for market quotes, owner-earnings and bank residual-income intrinsic valuation, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.
 
 For external application integration details, endpoint samples, response shapes, and client examples, see [API_DOCUMENTATION.md](API_DOCUMENTATION.md).
 
@@ -47,7 +47,7 @@ The legacy `GET /api/v1/stocks/{symbol}/fundamentals` and `POST /api/v1/stocks/{
 Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
 Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
 Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available. A cached TradingView scanner lookup also adds trailing P/E and 52-week high/low. These reference fields are nullable and do not make `/technical` depend on yFinance.
-Valuation responses use financial statements and a separately refreshed current quote. The implemented foundation values ordinary operating companies with an owner-earnings DCF; recognized banks and REITs currently return `valuation_unreliable` without running that model.
+Valuation responses use financial statements and a separately refreshed current quote. Ordinary operating companies use an owner-earnings DCF, banks use a residual-income model, and recognized REITs currently return `valuation_unreliable` without running either model.
 
 ## Markets
 
@@ -55,7 +55,8 @@ Exchange codes are mapped to Yahoo-compatible symbols where needed. For Singapor
 
 - Quote: `GET /api/v1/markets/SGX/D05/quote`
 - Analysis: `GET /api/v1/markets/SGX/D05/analysis?timeframe=1D`
-- Valuation: `GET /api/v1/markets/SGX/S63/valuation`
+- Ordinary-company valuation: `GET /api/v1/markets/SGX/S63/valuation`
+- Bank valuation: `GET /api/v1/markets/SGX/D05/valuation`
 - Technical: `GET /api/v1/markets/SGX/D05/technical?timeframe=1D`
 
 The provider also accepts Yahoo-style Singapore symbols such as `S63.SI` for valuation and returns public symbols such as `SGX:S63`. The same normalization remains available to analysis and technical routes. Market-wide SGX scanners still depend on the symbol universe available from the TradingView MCP package.
@@ -77,14 +78,15 @@ The implemented endpoint is:
 GET /api/v1/markets/{exchange}/{symbol}/valuation
 ```
 
-Ordinary-company examples:
+Ordinary-company and bank examples:
 
 ```text
 GET /api/v1/markets/NASDAQ/AAPL/valuation
 GET /api/v1/markets/SGX/S63/valuation
+GET /api/v1/markets/SGX/D05/valuation
 ```
 
-The current foundation recognizes company type automatically and supports only ordinary operating companies with `method: "owner_earnings_dcf"`. Banks and REITs are recognized but do not have an implemented model in this foundation; they return HTTP `200` with `status: "valuation_unreliable"`, reasons under `quality.reasons`, and no method or intrinsic-value claim. Unsupported or ambiguous securities behave the same way. The API does not fall back to an ordinary-company DCF for a bank or REIT.
+The API recognizes company type automatically. Ordinary operating companies use `method: "owner_earnings_dcf"`, while banks with compatible financial statements use `method: "bank_residual_income"`. Recognized REITs and unsupported or ambiguous securities return HTTP `200` with `status: "valuation_unreliable"`, reasons under `quality.reasons`, and no method or intrinsic-value claim. A failed bank calculation never falls back to the ordinary-company DCF.
 
 For every usable annual or trailing period, the model calculates:
 
@@ -105,7 +107,37 @@ The model projects ten years and fades growth toward the terminal rate:
 | Base | 100% of normalized | Derived growth, clamped to -15% through 12% | 10% | 2.5% |
 | Bull | 105% of normalized | Derived growth plus 3 points, cap 15% | 8% | 3% |
 
-Owner earnings are after interest and are discounted directly to equity value, then divided by current diluted shares. The foundation does not subtract debt again or add an automatic excess-cash adjustment.
+Owner earnings are after interest and are discounted directly to equity value, then divided by current diluted shares. The owner-earnings model does not subtract debt again or add an automatic excess-cash adjustment.
+
+### Bank Residual Income
+
+Banks use common equity and net income attributable to common shareholders rather than ordinary-company owner earnings. For forecast year `t`:
+
+```text
+excess return_t = (ROE_t - required return) * beginning common equity_t
+ending common equity_t = beginning common equity_t
+                       + projected net income_t
+                       - projected common dividends_t
+intrinsic common equity = current common equity
+                        + sum(excess return_t / (1 + required return)^t)
+intrinsic value per share = intrinsic common equity / current diluted shares
+```
+
+Historical ROE is `net income attributable to common / average beginning and ending common equity`. Historical payout is the absolute common-dividend amount divided by positive net income. The model requires positive current common equity, current diluted shares, and at least three usable annual observations with compatible common equity, common net income, common dividends, diluted shares, currency, and units; five observations are preferred. Invalid equity, share counts, payout outside 0% through 100%, non-finite values, or incompatible units produce `valuation_unreliable` rather than invented inputs.
+
+The normalized ROE and payout ratio are medians of up to the five most recent usable observations. Each scenario projects ten years. Year 1 starts from the scenario ROE factor, ROE fades linearly to the required return in year 10, net income equals beginning common equity times projected ROE, and retained earnings grow common equity after projected dividends:
+
+| Scenario | Starting normalized ROE | Required return |
+| --- | ---: | ---: |
+| Bear | 90% | 12% |
+| Base | 100% | 10% |
+| Bull | 105% | 8% |
+
+Because ROE reaches the required return in year 10, excess return converges to zero. Version 1 assigns no terminal excess return after year 10. The response exposes `normalized_roe`, `book_value_per_share`, `payout_ratio`, `usable_years`, and projected book equity under `model_details`.
+
+Optional bank-quality inputs are CET1 ratio, non-performing-loan ratio, loan-loss coverage, and reported regulatory-capital headroom. Missing optional metrics do not block a value, but they are reported in warnings/quality details and cap model confidence at medium. SGX fundamentals are yFinance-backed and also cannot receive high confidence; stale or materially incomplete data can lower confidence further.
+
+Bank deposits, borrowings, and regulatory liquidity are part of the bank's operating and funding model, so bank debt and working capital are not treated as ordinary-company owner-earnings adjustments. Residual income starts from common equity and after-interest common net income; subtracting debt or working-capital movements again would mix incompatible models and double count financing effects.
 
 The response reports finite positive `bear`, `base`, and `bull` values ordered from low to high. `margin_of_safety_price` is 75% of base intrinsic value. Price labels use this precedence:
 
@@ -189,7 +221,7 @@ $env:RUN_LIVE_TRADINGVIEW_TESTS = "1"
 .\.venv\Scripts\python.exe -m pytest -m live -q
 ```
 
-Run the opt-in live ordinary-company valuation smoke tests separately:
+Run the opt-in live ordinary-company and SGX bank valuation smoke tests separately:
 
 ```powershell
 $env:STOCK_API_SEC_USER_AGENT = "stock-api your-email@example.com"

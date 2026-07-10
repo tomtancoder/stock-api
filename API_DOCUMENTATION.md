@@ -76,11 +76,12 @@ Singapore stocks:
 ```text
 GET /api/v1/markets/SGX/D05/quote
 GET /api/v1/markets/SGX/D05/analysis?timeframe=1D
+GET /api/v1/markets/SGX/D05/valuation
 GET /api/v1/markets/SGX/D05/technical?timeframe=1D
 POST /api/v1/backtests/SGX/D05
 ```
 
-Internally, Singapore quote, analysis, and backtest data uses Yahoo-style `.SI` symbols such as `D05.SI`. TradingView MCP technical analysis strips that suffix and returns TradingView symbols such as `SGX:D05`.
+Internally, Singapore quote, analysis, valuation, and backtest data uses Yahoo-style `.SI` symbols such as `D05.SI`. TradingView MCP technical analysis strips that suffix and returns TradingView symbols such as `SGX:D05`.
 
 Spot gold:
 
@@ -165,7 +166,7 @@ triple_ema
 | `GET` | `/health` | Health check |
 | `GET` | `/api/v1/markets/{exchange}/{symbol}/quote` | Latest quote |
 | `GET` | `/api/v1/markets/{exchange}/{symbol}/analysis` | yfinance analysis and indicators |
-| `GET` | `/api/v1/markets/{exchange}/{symbol}/valuation` | Ordinary-company owner-earnings intrinsic valuation |
+| `GET` | `/api/v1/markets/{exchange}/{symbol}/valuation` | Model-routed owner-earnings or bank residual-income valuation |
 | `GET` | `/api/v1/markets/{exchange}/{symbol}/technical` | TradingView MCP technical analysis |
 | `GET` | `/api/v1/markets/{exchange}/gainers` | Market gainers |
 | `GET` | `/api/v1/markets/{exchange}/losers` | Market losers |
@@ -321,27 +322,28 @@ The analysis response is calculated locally from yfinance OHLCV history and can 
 GET /api/v1/markets/{exchange}/{symbol}/valuation
 ```
 
-This canonical GET automatically classifies the security and selects the model; clients cannot force a method or supply assumptions. The currently implemented foundation supports ordinary operating companies with `owner_earnings_dcf`.
+This canonical GET automatically classifies the security and selects the model; clients cannot force a method or supply assumptions. Ordinary operating companies use `owner_earnings_dcf`, and eligible banks use `bank_residual_income`.
 
 U.S. and SGX examples:
 
 ```bash
 curl "http://127.0.0.1:8000/api/v1/markets/NASDAQ/AAPL/valuation"
 curl "http://127.0.0.1:8000/api/v1/markets/SGX/S63/valuation"
+curl "http://127.0.0.1:8000/api/v1/markets/SGX/D05/valuation"
 ```
 
-For SGX, both `S63` and `S63.SI` are accepted, Yahoo access is normalized to `S63.SI`, the public response symbol is `SGX:S63`, and price and per-share values remain in `SGD`.
+For SGX, both bare and Yahoo-style symbols are accepted. For example, `D05` and `D05.SI` both normalize provider access to `D05.SI`, return public symbol `SGX:D05`, and preserve `SGD` for price and per-share values.
 
 Current company-type behavior:
 
 | Detected type | Current method | Result |
 | --- | --- | --- |
 | Ordinary operating company | `owner_earnings_dcf` | Three finite positive intrinsic values when inputs are eligible |
-| Bank | none | HTTP `200`, `status: "valuation_unreliable"` |
+| Bank | `bank_residual_income` | Three finite positive intrinsic values when bank inputs are eligible |
 | REIT or property trust | none | HTTP `200`, `status: "valuation_unreliable"` |
 | Unsupported or ambiguous | none | HTTP `200`, `status: "valuation_unreliable"` |
 
-Banks and REITs are recognized so they cannot accidentally enter owner-earnings DCF, but this foundation does not implement bank or REIT valuation. An unreliable response sets `method`, `confidence`, `intrinsic_value`, and `model_details` to `null`, sets `quality.eligible` to `false`, and explains the refusal in `quality.reasons`. Insurers, funds, commodities, cryptocurrencies, pre-revenue companies, incompatible currencies or units, and insufficient required facts can also produce this non-numerical result.
+Banks and REITs are recognized so they cannot accidentally enter owner-earnings DCF. Eligible banks now dispatch to residual income; a bank that fails its required-input checks returns `valuation_unreliable` and never falls back to owner earnings. An unreliable response sets `method`, `confidence`, `intrinsic_value`, and `model_details` to `null`, sets `quality.eligible` to `false`, and explains the refusal in `quality.reasons`. REITs, insurers, funds, commodities, cryptocurrencies, pre-revenue companies, incompatible currencies or units, and insufficient required facts can also produce this non-numerical result.
 
 #### Owner-Earnings Method
 
@@ -362,7 +364,7 @@ At least three positive annual owner-earnings periods are required and five are 
 2. Weighted three-year owner earnings using weights 1, 2, and 3 from oldest to newest.
 3. Five-year median owner-earnings margin multiplied by trailing revenue.
 
-Growth is derived from comparable per-share revenue and owner-earnings history. Each scenario projects ten years, fades growth linearly toward its terminal rate, discounts the annual owner earnings, adds the discounted terminal value, and divides the resulting equity value by current diluted shares. Owner earnings are already after interest; debt is not subtracted again, and the foundation does not add automatic excess cash.
+Growth is derived from comparable per-share revenue and owner-earnings history. Each scenario projects ten years, fades growth linearly toward its terminal rate, discounts the annual owner earnings, adds the discounted terminal value, and divides the resulting equity value by current diluted shares. Owner earnings are already after interest; debt is not subtracted again, and the owner-earnings model does not add automatic excess cash.
 
 | Scenario | Starting owner earnings | Initial growth | Required return | Terminal growth |
 | --- | ---: | ---: | ---: | ---: |
@@ -371,6 +373,88 @@ Growth is derived from comparable per-share revenue and owner-earnings history. 
 | Bull | 105% of normalized | Base plus 3 percentage points, cap 15% | 8% | 3% |
 
 The terminal formula is `OE10 * (1 + terminal_growth) / (required_return - terminal_growth)`. Every numerical result must be finite and positive and satisfy `bear <= base <= bull`.
+
+#### Bank Residual-Income Method
+
+Banks are valued from common book equity and after-interest net income attributable to common shareholders:
+
+```text
+historical ROE_t = net income attributable to common_t
+                 / average(beginning common equity_t, ending common equity_t)
+historical payout_t = abs(common dividends_t) / positive common net income_t
+
+projected net income_t = beginning common equity_t * projected ROE_t
+projected dividends_t = normalized payout ratio * projected net income_t
+excess return_t = (projected ROE_t - required return) * beginning common equity_t
+ending common equity_t = beginning common equity_t
+                       + projected net income_t
+                       - projected dividends_t
+
+intrinsic common equity = current common equity
+                        + sum(excess return_t / (1 + required return)^t)
+intrinsic value per share = intrinsic common equity / current diluted shares
+```
+
+Required inputs are positive current common equity, current diluted shares, and at least three usable annual observations with compatible common equity, net income attributable to common, common dividends, diluted shares, currency, and units; five usable observations are preferred. Normalized ROE and payout are the medians of up to the five most recent usable observations. Payout must remain between 0% and 100%; invalid payout, equity, shares, units, or non-finite values produce `valuation_unreliable` instead of being clamped or replaced with zero.
+
+All scenarios project ten years. Before the fade begins, bear ROE is 90% of normalized ROE, base is 100%, and bull is 105%. ROE fades linearly from that starting assumption to the scenario required return in year 10:
+
+| Scenario | Starting ROE factor | Required return |
+| --- | ---: | ---: |
+| Bear | 90% | 12% |
+| Base | 100% | 10% |
+| Bull | 105% | 8% |
+
+The annual calculation discounts excess return before adding retained earnings to the next year's common equity. When year-10 ROE reaches the required return, excess return is zero; version 1 assigns no persistent terminal excess return after year 10. The public `model_details` reports `normalized_roe`, `book_value_per_share`, `payout_ratio`, `usable_years`, ten annual projected book-equity values for each scenario, and nullable CET1, non-performing-loan, and loan-loss-coverage ratios.
+
+CET1 ratio, non-performing-loan ratio, loan-loss coverage, and reported regulatory-capital headroom are optional quality inputs. Missing optional metrics do not block a calculation, but the missing metrics appear in warnings and quality details and cap model confidence at medium. SGX fundamentals use yFinance and are independently capped below high confidence; stale or materially incomplete inputs can reduce confidence to low.
+
+Bank deposits, borrowings, and regulatory liquidity are operating/funding inputs rather than industrial-company financing adjustments. The bank model therefore does not calculate ordinary-company owner earnings, subtract working-capital movements, or subtract bank debt from residual-income equity value. It starts from common equity and after-interest common net income, so those ordinary-company adjustments would mix models and double count financing effects.
+
+A successful `SGX:D05` response uses the same common envelope as an ordinary-company valuation. This schema excerpt is illustrative, the projected arrays are shortened, and market-dependent values are not API constants:
+
+```json
+{
+  "symbol": "SGX:D05",
+  "exchange": "SGX",
+  "currency": "SGD",
+  "detected_company_type": "bank",
+  "method": "bank_residual_income",
+  "confidence": "medium",
+  "intrinsic_value": {
+    "bear": 10.25,
+    "base": 12.4,
+    "bull": 14.8
+  },
+  "model_details": {
+    "method": "bank_residual_income",
+    "normalized_roe": 0.12,
+    "book_value_per_share": 11.1,
+    "payout_ratio": 0.45,
+    "usable_years": 5,
+    "projected_book_equity": {
+      "bear": [100.0, 105.0],
+      "base": [100.0, 106.0],
+      "bull": [100.0, 107.0]
+    },
+    "cet1_ratio": null,
+    "npl_ratio": null,
+    "loan_loss_coverage": null
+  },
+  "data_quality": {
+    "primary_source": "yfinance_sgx",
+    "stale": false,
+    "missing_fields": []
+  },
+  "sources": {
+    "common_equity": "yfinance",
+    "net_income_common": "yfinance",
+    "common_dividends": "yfinance",
+    "diluted_shares": "yfinance",
+    "current_price": "existing_quote_provider"
+  }
+}
+```
 
 #### Price Classification
 
@@ -399,7 +483,7 @@ A reliable response contains:
 - `detected_company_type`, `method`, `classification_sources`, `status`, and `confidence`.
 - `current_price` and a separate `price_as_of` timestamp.
 - `intrinsic_value` with bear, base, bull, margin-of-safety price, price-to-base ratio, and upside/downside percentage.
-- `model_details` with normalized owner earnings, per-share owner earnings, maintenance-capex method, annual history, derived growth, and usable years.
+- Model-specific `model_details`: owner-earnings normalization/history for ordinary companies, or normalized ROE, book value per share, payout, projected book equity, and optional quality ratios for banks.
 - Fixed model `assumptions`, `quality`, field-level `sources`, and `warnings`.
 - `data_quality.primary_source`, `financials_as_of`, `valuation_as_of`, `next_refresh_at`, `stale`, and `missing_fields`.
 
@@ -839,10 +923,10 @@ These routes are kept for compatibility with older clients. New applications sho
 | --- | --- | --- |
 | `GET` | `/api/v1/stocks/{symbol}/quote?exchange=NASDAQ` | `/api/v1/markets/{exchange}/{symbol}/quote` |
 | `GET` | `/api/v1/stocks/{symbol}/technicals?exchange=NASDAQ&timeframe=1D&include_multi_timeframe=false` | `/api/v1/markets/{exchange}/{symbol}/technical` |
-| `POST` | `/api/v1/stocks/{symbol}/valuation?exchange=NASDAQ&timeframe=1D` | Not supported; use the canonical market GET for eligible ordinary companies |
+| `POST` | `/api/v1/stocks/{symbol}/valuation?exchange=NASDAQ&timeframe=1D` | Not supported; use the canonical market GET for eligible ordinary companies or banks |
 | `GET` | `/api/v1/stocks/{symbol}/fundamentals` | Not supported |
 
-`/api/v1/stocks/{symbol}/fundamentals` and the legacy stock valuation POST return HTTP `501` because the previous yFinance fundamentals and DCF model were removed. The canonical market valuation GET is a separate typed owner-earnings implementation and does not revive or alias the legacy request contract.
+`/api/v1/stocks/{symbol}/fundamentals` and the legacy stock valuation POST return HTTP `501` because the previous yFinance fundamentals and DCF model were removed. The canonical market valuation GET is a separate typed, model-routed implementation and does not revive or alias the legacy request contract.
 
 ## Error Handling
 
@@ -1015,7 +1099,7 @@ $env:MARKETAUX_API_TOKEN = "..."
 - Prefer `/api/v1/markets/...` for all new applications.
 - The legacy `/api/v1/stocks/...` endpoints may be removed in a future breaking version.
 - Intrinsic valuation and price labels are model estimates, not investment advice.
-- Bank and REIT valuation is not implemented in the current foundation; handle `valuation_unreliable` explicitly.
+- Bank residual-income valuation is implemented; REITs and failed bank eligibility checks still require explicit `valuation_unreliable` handling.
 - Keep intrinsic valuation separate from TradingView technical signals in client decision logic.
 - Backtest results are historical simulations and are not predictive.
 - Market-wide screeners can be unavailable for markets where TradingView MCP does not provide a usable symbol universe.

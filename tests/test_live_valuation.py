@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import app
-from app.schemas import ValuationResponse
+from app.schemas import BankValuationDetails, ValuationResponse
 from app.services import sec_companyfacts
 from app.services import valuation_fundamentals
 from app.services import valuation_service
@@ -109,3 +109,41 @@ def test_live_ordinary_company_valuation(
             currency=currency,
             expected_primary_sources=expected_primary_sources,
         )
+
+
+def test_live_sgx_bank_valuation() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/v1/markets/SGX/D05/valuation")
+
+    assert response.status_code == 200, response.text
+    valuation = ValuationResponse.model_validate(response.json())
+    assert valuation.symbol == "SGX:D05"
+    assert valuation.currency == "SGD"
+    assert valuation.detected_company_type == "bank"
+    assert valuation.method == "bank_residual_income"
+    assert valuation.confidence in {"medium", "low"}
+    assert valuation.data_quality.primary_source == "yfinance_sgx"
+    assert isinstance(valuation.model_details, BankValuationDetails)
+
+    intrinsic_value = valuation.intrinsic_value
+    assert intrinsic_value is not None
+    scenario_values = (
+        intrinsic_value.bear,
+        intrinsic_value.base,
+        intrinsic_value.bull,
+    )
+    assert all(math.isfinite(value) and value > 0 for value in scenario_values)
+    assert scenario_values[0] <= scenario_values[1] <= scenario_values[2]
+
+    required_bank_source_fields = {
+        "common_equity",
+        "net_income_common",
+        "common_dividends",
+        "diluted_shares",
+    }
+    assert required_bank_source_fields <= valuation.sources.keys()
+    assert all(
+        valuation.sources[field].startswith("yfinance")
+        for field in required_bank_source_fields
+    )
+    assert valuation.sources.get("current_price") == "existing_quote_provider"
