@@ -749,6 +749,45 @@ def test_does_not_union_sparse_quarters_across_unrelated_fields(
     assert all(not period.is_ttm for period in result.periods)
 
 
+def test_does_not_build_ttm_from_short_quarters_with_uncovered_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    quarter_specs = (
+        ("2025-01-01", "2025-03-02", "CY2025Q1", 10),
+        ("2025-03-23", "2025-05-22", "CY2025Q2", 20),
+        ("2025-06-12", "2025-08-11", "CY2025Q3", 30),
+        ("2025-09-01", "2025-10-31", "CY2025Q4", 40),
+    )
+    short_quarters = [
+        sec_fact(
+            value,
+            start=start,
+            end=end,
+            form="10-Q",
+            filed=end,
+            accession=f"short-{frame}",
+            fiscal_year=2025,
+            fiscal_period=frame[-2:],
+            frame=frame,
+        )
+        for start, end, frame, value in quarter_specs
+    ]
+    facts = company_facts(
+        {
+            "Revenues": {
+                "USD": [sec_fact(500), *short_quarters]
+            }
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+
+    assert all(not period.is_ttm for period in result.periods)
+
+
 def test_preserves_missing_values_and_uses_submission_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

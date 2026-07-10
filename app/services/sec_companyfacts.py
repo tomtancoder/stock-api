@@ -421,10 +421,10 @@ def _coherent_quarter_window(
         assert previous.start is not None
         assert current.start is not None
         gap_days = (current.start - previous.end).days
-        if not 1 <= gap_days <= 35 or current.end <= previous.end:
+        if gap_days != 1 or current.end <= previous.end:
             return False
     assert facts[0].start is not None
-    return 300 <= (facts[-1].end - facts[0].start).days <= 400
+    return 330 <= (facts[-1].end - facts[0].start).days <= 400
 
 
 def _select_same_concept_quarters(
@@ -597,7 +597,7 @@ def _is_quarter_fact(fact: _SecFact, field: str) -> bool:
         return True
     if fact.start is None:
         return False
-    return 60 <= (fact.end - fact.start).days <= 120
+    return 75 <= (fact.end - fact.start).days <= 105
 
 
 def _frame_index(frame: str | None) -> int | None:
