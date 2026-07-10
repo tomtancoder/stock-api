@@ -115,9 +115,17 @@ def _validate_periods(
     for period in periods:
         if period.currency.strip().upper() != valuation_currency:
             raise ValueError("REIT history must use the valuation currency")
-        for value in (period.distribution_per_unit, period.nav_per_unit):
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError("REIT history values must be finite")
+        dpu = period.distribution_per_unit
+        if dpu is not None and not _is_finite_real(dpu):
+            raise ValueError("REIT history values must be finite")
+        nav_per_unit = period.nav_per_unit
+        if nav_per_unit is not None and (
+            not _is_finite_real(nav_per_unit) or nav_per_unit <= 0
+        ):
+            raise ValueError(
+                "REIT valuation has invalid NAV per unit; supplied NAV must "
+                "be finite and positive"
+            )
 
 
 def _positive_observations(
@@ -252,6 +260,8 @@ def _project_distributions(
         if not math.isfinite(discounted_dpu) or discounted_dpu <= 0:
             raise ValueError("REIT distribution projection must remain positive and finite")
         present_value += discounted_dpu
+        if not math.isfinite(present_value):
+            raise ValueError("REIT distribution present value must remain finite")
     return present_value, dpu
 
 
@@ -263,6 +273,8 @@ def _present_value_terminal_nav(
         * ((1.0 + growth) ** _PROJECTION_YEARS)
         * terminal_factor
     )
+    if not math.isfinite(terminal_nav) or terminal_nav <= 0:
+        raise ValueError("REIT terminal NAV must be positive and finite")
     present_value = terminal_nav / ((1.0 + required_return) ** _PROJECTION_YEARS)
     if not math.isfinite(present_value) or present_value <= 0:
         raise ValueError("REIT terminal NAV must be positive and finite")
@@ -279,6 +291,10 @@ def _present_value_terminal_distribution(
         * (1.0 + terminal_growth)
         / (required_return - terminal_growth)
     )
+    if not math.isfinite(terminal_value) or terminal_value <= 0:
+        raise ValueError(
+            "REIT terminal distribution value must be positive and finite"
+        )
     present_value = terminal_value / ((1.0 + required_return) ** _PROJECTION_YEARS)
     if not math.isfinite(present_value) or present_value <= 0:
         raise ValueError("REIT terminal distribution value must be positive and finite")
@@ -311,50 +327,56 @@ def value_reit(fundamentals: ValuationFundamentals) -> ModelResult:
     except ValueError as exc:
         raise _unreliable([str(exc)]) from exc
 
-    scenario_inputs = _scenario_inputs(normalized)
-    scenario_values: dict[str, float] = {}
-    scenario_contributions: dict[str, dict[str, float]] = {}
-    distribution_only = normalized.current_nav_per_unit is None
-    for name, assumptions in scenario_inputs.items():
-        pv_distributions, dpu_year_ten = _project_distributions(
-            normalized.normalized_dpu,
-            starting_factor=assumptions["starting_dpu_factor"],
-            growth=assumptions["dpu_growth"],
-            required_return=assumptions["required_return"],
-        )
-        if distribution_only:
-            terminal_growth = _TERMINAL_DISTRIBUTION_GROWTH[name]
-            pv_terminal_value = _present_value_terminal_distribution(
-                dpu_year_ten,
-                terminal_growth=terminal_growth,
+    try:
+        scenario_inputs = _scenario_inputs(normalized)
+        scenario_values: dict[str, float] = {}
+        scenario_contributions: dict[str, dict[str, float]] = {}
+        distribution_only = normalized.current_nav_per_unit is None
+        for name, assumptions in scenario_inputs.items():
+            pv_distributions, dpu_year_ten = _project_distributions(
+                normalized.normalized_dpu,
+                starting_factor=assumptions["starting_dpu_factor"],
+                growth=assumptions["dpu_growth"],
                 required_return=assumptions["required_return"],
             )
-            scenario_contributions[name] = {
-                "pv_distributions": pv_distributions,
-                "pv_terminal_value": pv_terminal_value,
-            }
-            scenario_values[name] = round(
-                pv_distributions + pv_terminal_value, 4
-            )
-            assumptions["terminal_growth"] = terminal_growth
-            continue
-        pv_terminal_nav = _present_value_terminal_nav(
-            normalized.current_nav_per_unit,
-            growth=assumptions["nav_growth"],
-            terminal_factor=assumptions["terminal_nav_factor"],
-            required_return=assumptions["required_return"],
-        )
-        scenario_contributions[name] = {
-            "pv_distributions": pv_distributions,
-            "pv_terminal_nav": pv_terminal_nav,
-        }
-        scenario_values[name] = round(pv_distributions + pv_terminal_nav, 4)
+            if distribution_only:
+                terminal_growth = _TERMINAL_DISTRIBUTION_GROWTH[name]
+                pv_terminal_value = _present_value_terminal_distribution(
+                    dpu_year_ten,
+                    terminal_growth=terminal_growth,
+                    required_return=assumptions["required_return"],
+                )
+                scenario_contributions[name] = {
+                    "pv_distributions": pv_distributions,
+                    "pv_terminal_value": pv_terminal_value,
+                }
+                total_value = pv_distributions + pv_terminal_value
+                assumptions["terminal_growth"] = terminal_growth
+            else:
+                pv_terminal_nav = _present_value_terminal_nav(
+                    normalized.current_nav_per_unit,
+                    growth=assumptions["nav_growth"],
+                    terminal_factor=assumptions["terminal_nav_factor"],
+                    required_return=assumptions["required_return"],
+                )
+                scenario_contributions[name] = {
+                    "pv_distributions": pv_distributions,
+                    "pv_terminal_nav": pv_terminal_nav,
+                }
+                total_value = pv_distributions + pv_terminal_nav
+            if not math.isfinite(total_value) or total_value <= 0:
+                raise ValueError("REIT scenario value must be positive and finite")
+            scenario_values[name] = round(total_value, 4)
 
-    validate_scenarios(
-        scenario_values["bear"],
-        scenario_values["base"],
-        scenario_values["bull"],
-    )
+        validate_scenarios(
+            scenario_values["bear"],
+            scenario_values["base"],
+            scenario_values["bull"],
+        )
+    except (ArithmeticError, ValueError) as exc:
+        raise _unreliable(
+            ["REIT valuation arithmetic produced an overflow or non-finite result."]
+        ) from exc
 
     reit_metrics, ignored_reit_metrics = _sanitize_reit_metrics(
         fundamentals.reit_metrics

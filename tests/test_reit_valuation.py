@@ -224,6 +224,26 @@ def test_value_reit_uses_distribution_only_gordon_fallback_when_nav_is_missing()
     assert result.bear <= result.base <= result.bull
 
 
+def test_value_reit_rejects_invalid_supplied_nav_instead_of_using_fallback():
+    periods = [
+        _period(year, dpu=dpu, nav_per_unit=-1.0)
+        for year, dpu in zip(range(2023, 2026), [0.05, 0.06, 0.07])
+    ]
+
+    with pytest.raises(ValuationUnreliable, match="invalid NAV"):
+        value_reit(_fundamentals(periods))
+
+
+def test_value_reit_translates_non_finite_projection_output_to_unreliable():
+    periods = [
+        _period(year, dpu=2.5e307, nav_per_unit=2.5e307)
+        for year in range(2023, 2026)
+    ]
+
+    with pytest.raises(ValuationUnreliable, match="non-finite"):
+        value_reit(_fundamentals(periods))
+
+
 def test_value_reit_reports_optional_reit_metric_gaps_without_blocking():
     result = value_reit(_fundamentals(_reit_periods()))
 
