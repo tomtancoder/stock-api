@@ -323,6 +323,17 @@ def test_sgx_provider_normalizes_symbols_currency_periods_and_calls_all_sources(
     assert result.primary_source == "yfinance_sgx"
     assert result.provider_security_type == "EQUITY"
     assert result.current_diluted_shares == 42.0
+    assert result.sources["current_diluted_shares"] == "yfinance"
+    assert {
+        period.sources["diluted_shares"].unit
+        for period in result.periods
+        if "diluted_shares" in period.sources
+    } == {"shares"}
+    assert {
+        period.sources["revenue"].unit
+        for period in result.periods
+        if "revenue" in period.sources
+    } == {"SGD"}
     assert [(period.period_end.isoformat(), period.is_ttm) for period in result.periods] == [
         ("2024-12-31", False),
         ("2025-12-31", False),

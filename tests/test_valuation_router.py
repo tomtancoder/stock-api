@@ -213,6 +213,33 @@ def test_explicit_reit_type_takes_precedence_over_bank_evidence(monkeypatch):
         valuation_router.route_valuation(fundamentals)
 
 
+def test_explicit_unsupported_type_precedes_reit_industry_metadata(monkeypatch):
+    etf = _fundamentals(
+        provider_security_type="ETF",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        periods=[_operating_period(year) for year in range(2023, 2026)],
+    )
+    equity_reit = etf.model_copy(
+        update={"provider_security_type": "EQUITY"}, deep=True
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail("fund or REIT must not use owner earnings"),
+    )
+
+    etf_classification = valuation_router.classify_company(etf)
+    reit_classification = valuation_router.classify_company(equity_reit)
+
+    assert etf_classification.company_type == "unsupported"
+    assert etf_classification.sources == ("provider_security_type",)
+    assert reit_classification.company_type == "reit"
+    assert "industry" in reit_classification.sources
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(etf)
+
+
 def test_insurer_is_unsupported(monkeypatch):
     fundamentals = _fundamentals(
         sector="Financial Services",

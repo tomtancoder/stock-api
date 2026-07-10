@@ -60,15 +60,6 @@ def classify_company(
     fundamentals: ValuationFundamentals,
 ) -> CompanyClassification:
     metadata = _metadata(fundamentals)
-    reit_sources = _matching_sources(metadata, _REIT_TERMS)
-    if reit_sources:
-        return CompanyClassification(
-            company_type="reit",
-            supported=False,
-            sources=reit_sources,
-            reasons=("REIT valuation is recognized but not supported yet.",),
-        )
-
     security_metadata = tuple(
         item for item in metadata if item[0] == "provider_security_type"
     )
@@ -81,6 +72,15 @@ def classify_company(
             supported=False,
             sources=unsupported_security_sources,
             reasons=("The security type has no approved valuation model.",),
+        )
+
+    reit_sources = _matching_sources(metadata, _REIT_TERMS)
+    if reit_sources:
+        return CompanyClassification(
+            company_type="reit",
+            supported=False,
+            sources=reit_sources,
+            reasons=("REIT valuation is recognized but not supported yet.",),
         )
 
     bank_metadata = tuple(

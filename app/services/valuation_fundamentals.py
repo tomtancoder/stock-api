@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 
 from app.core.config import get_settings
@@ -25,6 +25,14 @@ class FundamentalsEnvelope:
     stale_until: datetime
     stale: bool
     warnings: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _RefreshFlight:
+    event: Event
+    generation: int
+    result: FundamentalsEnvelope | None = None
+    error: BaseException | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +68,8 @@ _METADATA_FIELDS = (
 _PROVIDER_ERRORS = (SecCompanyFactsError, YFinanceStatementsError)
 
 _CACHE: dict[tuple[str, str], _CacheEntry] = {}
+_IN_FLIGHT: dict[tuple[str, str], _RefreshFlight] = {}
+_CACHE_GENERATION = 0
 _CACHE_LOCK = Lock()
 
 
@@ -67,52 +77,128 @@ def get_fundamentals(exchange: str, symbol: str) -> FundamentalsEnvelope:
     venue = normalize_exchange(exchange)
     public_symbol = to_public_symbol(venue, symbol)
     key = (venue, public_symbol)
-    now = monotonic()
-
-    with _CACHE_LOCK:
-        cached = _CACHE.get(key)
-        if cached is not None and now < cached.fresh_deadline:
-            return cached.envelope
+    flight: _RefreshFlight
+    while True:
+        now = monotonic()
+        with _CACHE_LOCK:
+            cached = _CACHE.get(key)
+            if cached is not None and now < cached.fresh_deadline:
+                return _clone_envelope(cached.envelope)
+            flight = _IN_FLIGHT.get(key)
+            if flight is None:
+                flight = _RefreshFlight(
+                    event=Event(), generation=_CACHE_GENERATION
+                )
+                _IN_FLIGHT[key] = flight
+                break
+        flight.event.wait()
+        if flight.result is not None:
+            return _clone_envelope(flight.result)
+        if flight.error is not None:
+            raise flight.error
 
     try:
         fundamentals, source_warnings = _fetch_uncached(venue, symbol)
-    except _PROVIDER_ERRORS as exc:
-        if cached is not None and monotonic() < cached.stale_deadline:
+        settings = get_settings()
+        fresh_ttl = int(settings.valuation_cache_ttl_seconds)
+        stale_ttl = max(
+            fresh_ttl, int(settings.valuation_stale_ttl_seconds)
+        )
+        stored_at = monotonic()
+        wall_time = datetime.now(timezone.utc)
+        warnings = _unique((*fundamentals.warnings, *source_warnings))
+        normalized = fundamentals.model_copy(
+            deep=True, update={"warnings": list(warnings)}
+        )
+        envelope = FundamentalsEnvelope(
+            fundamentals=normalized,
+            fresh_until=wall_time + timedelta(seconds=fresh_ttl),
+            stale_until=wall_time + timedelta(seconds=stale_ttl),
+            stale=False,
+            warnings=warnings,
+        )
+        entry = _CacheEntry(
+            envelope=envelope,
+            fresh_deadline=stored_at + fresh_ttl,
+            stale_deadline=stored_at + stale_ttl,
+        )
+    except BaseException as exc:  # noqa: BLE001 - release all waiting callers.
+        return _complete_failed_refresh(key, flight, exc)
+    return _complete_successful_refresh(key, flight, entry)
+
+
+def _complete_successful_refresh(
+    key: tuple[str, str],
+    flight: _RefreshFlight,
+    entry: _CacheEntry,
+) -> FundamentalsEnvelope:
+    with _CACHE_LOCK:
+        owns_generation = (
+            _IN_FLIGHT.get(key) is flight
+            and flight.generation == _CACHE_GENERATION
+        )
+        current = _CACHE.get(key)
+        if owns_generation:
+            _CACHE[key] = entry
+            result = entry.envelope
+            del _IN_FLIGHT[key]
+        elif current is not None and monotonic() < current.fresh_deadline:
+            result = current.envelope
+        else:
+            result = entry.envelope
+        flight.result = result
+        flight.event.set()
+    return _clone_envelope(result)
+
+
+def _complete_failed_refresh(
+    key: tuple[str, str],
+    flight: _RefreshFlight,
+    exc: BaseException,
+) -> FundamentalsEnvelope:
+    with _CACHE_LOCK:
+        current = _CACHE.get(key)
+        now = monotonic()
+        result: FundamentalsEnvelope | None = None
+        error: BaseException | None = exc
+        if current is not None and now < current.fresh_deadline:
+            result = current.envelope
+            error = None
+        elif (
+            isinstance(exc, _PROVIDER_ERRORS)
+            and current is not None
+            and now < current.stale_deadline
+        ):
             warning = (
                 "Fundamentals refresh failed; serving stale cached data: "
                 f"{exc}"
             )
-            return FundamentalsEnvelope(
-                fundamentals=cached.envelope.fundamentals,
-                fresh_until=cached.envelope.fresh_until,
-                stale_until=cached.envelope.stale_until,
+            result = FundamentalsEnvelope(
+                fundamentals=current.envelope.fundamentals,
+                fresh_until=current.envelope.fresh_until,
+                stale_until=current.envelope.stale_until,
                 stale=True,
-                warnings=_unique((*cached.envelope.warnings, warning)),
+                warnings=_unique((*current.envelope.warnings, warning)),
             )
-        raise
+            error = None
+        if _IN_FLIGHT.get(key) is flight:
+            del _IN_FLIGHT[key]
+        flight.result = result
+        flight.error = error
+        flight.event.set()
+    if result is not None:
+        return _clone_envelope(result)
+    raise exc
 
-    settings = get_settings()
-    fresh_ttl = int(settings.valuation_cache_ttl_seconds)
-    stale_ttl = max(fresh_ttl, int(settings.valuation_stale_ttl_seconds))
-    stored_at = monotonic()
-    wall_time = datetime.now(timezone.utc)
-    warnings = _unique((*fundamentals.warnings, *source_warnings))
-    normalized = fundamentals.model_copy(update={"warnings": list(warnings)})
-    envelope = FundamentalsEnvelope(
-        fundamentals=normalized,
-        fresh_until=wall_time + timedelta(seconds=fresh_ttl),
-        stale_until=wall_time + timedelta(seconds=stale_ttl),
-        stale=False,
-        warnings=warnings,
+
+def _clone_envelope(envelope: FundamentalsEnvelope) -> FundamentalsEnvelope:
+    return FundamentalsEnvelope(
+        fundamentals=envelope.fundamentals.model_copy(deep=True),
+        fresh_until=envelope.fresh_until,
+        stale_until=envelope.stale_until,
+        stale=envelope.stale,
+        warnings=tuple(envelope.warnings),
     )
-    entry = _CacheEntry(
-        envelope=envelope,
-        fresh_deadline=stored_at + fresh_ttl,
-        stale_deadline=stored_at + stale_ttl,
-    )
-    with _CACHE_LOCK:
-        _CACHE[key] = entry
-    return envelope
 
 
 def _fetch_uncached(
@@ -307,5 +393,12 @@ def _unique(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 
 
 def _clear_cache() -> None:
+    global _CACHE_GENERATION
+
     with _CACHE_LOCK:
         _CACHE.clear()
+        _CACHE_GENERATION += 1
+        flights = tuple(_IN_FLIGHT.values())
+        _IN_FLIGHT.clear()
+        for flight in flights:
+            flight.event.set()

@@ -450,7 +450,7 @@ def _build_trailing_period(
         sources[field] = _provenance(
             concept,
             period_end,
-            currency,
+            _unit_for_field(field, currency),
             "quarterly_ttm",
         )
 
@@ -501,7 +501,12 @@ def _build_period(
             continue
         value, concept = extracted
         values[field] = value
-        sources[field] = _provenance(concept, period_end, currency, form)
+        sources[field] = _provenance(
+            concept,
+            period_end,
+            _unit_for_field(field, currency),
+            form,
+        )
 
     interest = _period_interest(
         frames["cashflow"], period_end, interest_classification
@@ -603,15 +608,19 @@ def _timestamp(value: Any) -> pd.Timestamp | None:
 
 
 def _provenance(
-    concept: str, period_end: date, currency: str, form: str
+    concept: str, period_end: date, unit: str, form: str
 ) -> FactProvenance:
     return FactProvenance(
         provider="yfinance",
         concept=concept,
         form=form,
         period_end=period_end,
-        unit=currency,
+        unit=unit,
     )
+
+
+def _unit_for_field(field: str, currency: str) -> str:
+    return "shares" if field == "diluted_shares" else currency
 
 
 def _current_shares(

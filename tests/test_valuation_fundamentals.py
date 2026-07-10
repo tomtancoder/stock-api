@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timezone
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -379,6 +380,177 @@ def test_slow_refresh_failure_cannot_serve_entry_past_stale_deadline(monkeypatch
         valuation_fundamentals.get_fundamentals("SGX", "D05")
 
 
+def test_expired_refresh_is_single_flight_and_waiters_use_installed_result(
+    monkeypatch,
+):
+    initial = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:D05",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        industry="Initial",
+    )
+    slow = initial.model_copy(update={"industry": "Slow owner result"})
+    fast = initial.model_copy(update={"industry": "Fast duplicate result"})
+    now = [0.0]
+    calls = 0
+    calls_lock = Lock()
+    slow_started = Event()
+    duplicate_started = Event()
+    release_slow = Event()
+    waiter_waiting = Event()
+    results: list[ValuationFundamentals] = []
+    errors: list[BaseException] = []
+
+    class TrackingRefreshEvent:
+        def __init__(self) -> None:
+            self._inner = Event()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_waiting.set()
+            return self._inner.wait(timeout)
+
+        def set(self) -> None:
+            self._inner.set()
+
+    def fetch_yahoo(exchange: str, symbol: str) -> ValuationFundamentals:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            return initial
+        if call_number == 2:
+            slow_started.set()
+            assert release_slow.wait(2), "test did not release slow refresh"
+            return slow
+        duplicate_started.set()
+        return fast
+
+    def call_facade() -> None:
+        try:
+            results.append(
+                valuation_fundamentals.get_fundamentals(
+                    "SGX", "D05"
+                ).fundamentals
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread assertion relay.
+            errors.append(exc)
+
+    monkeypatch.setattr(valuation_fundamentals, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        valuation_fundamentals, "Event", lambda: TrackingRefreshEvent()
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals, "fetch_yfinance_fundamentals", fetch_yahoo
+    )
+
+    valuation_fundamentals.get_fundamentals("SGX", "D05")
+    now[0] = 61.0
+    owner = Thread(target=call_facade)
+    waiter = Thread(target=call_facade)
+    owner.start()
+    assert slow_started.wait(2), "owner refresh did not start"
+    waiter.start()
+    assert waiter_waiting.wait(2), "waiter did not join in-flight refresh"
+    release_slow.set()
+    owner.join(2)
+    waiter.join(2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert errors == []
+    assert duplicate_started.is_set() is False
+    assert calls == 2
+    assert [result.industry for result in results] == [
+        "Slow owner result",
+        "Slow owner result",
+    ]
+    assert (
+        valuation_fundamentals.get_fundamentals(
+            "SGX", "D05"
+        ).fundamentals.industry
+        == "Slow owner result"
+    )
+    assert calls == 2
+
+
+def test_refresh_owner_notifies_waiters_when_cache_entry_build_fails(monkeypatch):
+    yahoo = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:D05",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+    )
+    provider_started = Event()
+    release_provider = Event()
+    waiter_waiting = Event()
+    inner_flight_event = Event()
+    settings_calls = 0
+    provider_calls = 0
+    errors: list[BaseException] = []
+
+    class TrackingFlightEvent:
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_waiting.set()
+            return inner_flight_event.wait(timeout)
+
+        def set(self) -> None:
+            inner_flight_event.set()
+
+    def settings() -> SimpleNamespace:
+        nonlocal settings_calls
+        settings_calls += 1
+        if settings_calls == 2:
+            raise RuntimeError("cache entry build failed")
+        return _settings()
+
+    def fetch_yahoo(exchange: str, symbol: str) -> ValuationFundamentals:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            provider_started.set()
+            assert release_provider.wait(2), "test did not release provider"
+        return yahoo
+
+    def call_facade() -> None:
+        try:
+            valuation_fundamentals.get_fundamentals("SGX", "D05")
+        except BaseException as exc:  # noqa: BLE001 - thread assertion relay.
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        valuation_fundamentals, "Event", lambda: TrackingFlightEvent()
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", settings)
+    monkeypatch.setattr(
+        valuation_fundamentals, "fetch_yfinance_fundamentals", fetch_yahoo
+    )
+
+    owner = Thread(target=call_facade)
+    waiter = Thread(target=call_facade)
+    owner.start()
+    assert provider_started.wait(2), "owner provider call did not start"
+    waiter.start()
+    assert waiter_waiting.wait(2), "waiter did not observe in-flight refresh"
+    release_provider.set()
+    owner.join(2)
+    waiter.join(0.2)
+    waiter_was_stuck = waiter.is_alive()
+    if waiter_was_stuck:
+        valuation_fundamentals._clear_cache()
+        waiter.join(2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert waiter_was_stuck is False
+    assert [str(error) for error in errors] == [
+        "cache entry build failed",
+        "cache entry build failed",
+    ]
+
+
 def test_provider_failure_without_usable_stale_entry_remains_typed(monkeypatch):
     monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
     monkeypatch.setattr(
@@ -425,3 +597,85 @@ def test_fundamentals_envelope_is_immutable(monkeypatch):
 
     with pytest.raises(FrozenInstanceError):
         envelope.stale = True
+
+
+def test_cached_fundamentals_are_deeply_isolated_from_callers_and_provider(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    yahoo = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:D05",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        periods=[
+            _period(
+                period_end,
+                currency="SGD",
+                provider="yfinance",
+                operating_cash_flow=100.0,
+                capital_expenditure=-20.0,
+                revenue=300.0,
+            )
+        ],
+        warnings=["provider warning"],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    first = valuation_fundamentals.get_fundamentals("SGX", "D05")
+    first.fundamentals.industry = "caller mutation"
+    first.fundamentals.warnings.append("caller warning")
+    first.fundamentals.sources["financial_statements"] = "caller source"
+    first.fundamentals.periods[0].sources[
+        "operating_cash_flow"
+    ] = FactProvenance(
+        provider="caller",
+        concept="mutated",
+        period_end=period_end,
+        unit="SGD",
+    )
+    first.fundamentals.periods.append(
+        _period(
+            date(2024, 12, 31),
+            currency="SGD",
+            provider="caller",
+            revenue=1.0,
+        )
+    )
+    yahoo.periods[0].sources["capital_expenditure"] = FactProvenance(
+        provider="provider mutation",
+        concept="mutated",
+        period_end=period_end,
+        unit="SGD",
+    )
+
+    second = valuation_fundamentals.get_fundamentals("SGX", "D05")
+
+    assert second is not first
+    assert second.fundamentals is not first.fundamentals
+    assert second.fundamentals.industry == "Software"
+    assert second.fundamentals.warnings == [
+        "provider warning",
+        "SGX yFinance fundamentals cap valuation confidence at medium.",
+    ]
+    assert second.fundamentals.sources == {
+        "financial_statements": "yfinance_sgx"
+    }
+    assert len(second.fundamentals.periods) == 1
+    assert (
+        second.fundamentals.periods[0]
+        .sources["operating_cash_flow"]
+        .provider
+        == "yfinance"
+    )
+    assert (
+        second.fundamentals.periods[0]
+        .sources["capital_expenditure"]
+        .provider
+        == "yfinance"
+    )
