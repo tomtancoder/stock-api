@@ -128,12 +128,31 @@ def test_operating_company_classifies_and_routes_to_owner_earnings(monkeypatch):
     assert calls == [fundamentals]
 
 
-def test_bank_requires_industry_metadata_and_bank_like_statements(monkeypatch):
+def test_supported_bank_routes_once_to_residual_income(monkeypatch):
     fundamentals = _fundamentals(
         sector="Financial Services",
         industry="Banks - Regional",
         issuer_classification="Commercial Banking",
-        periods=[_bank_period(year) for year in range(2023, 2026)],
+        periods=[_bank_period(year) for year in range(2022, 2026)],
+    )
+    expected = ModelResult(
+        method="bank_residual_income",
+        detected_company_type="bank",
+        bear=10.0,
+        base=20.0,
+        bull=30.0,
+        details={},
+        assumptions={},
+        quality={"eligible": True, "reasons": []},
+    )
+    calls: list[ValuationFundamentals] = []
+
+    def fake_value(candidate: ValuationFundamentals) -> ModelResult:
+        calls.append(candidate)
+        return expected
+
+    monkeypatch.setattr(
+        valuation_router, "value_bank", fake_value, raising=False
     )
     monkeypatch.setattr(
         valuation_router,
@@ -142,14 +161,15 @@ def test_bank_requires_industry_metadata_and_bank_like_statements(monkeypatch):
     )
 
     classification = valuation_router.classify_company(fundamentals)
+    result = valuation_router.route_valuation(fundamentals)
 
     assert classification.company_type == "bank"
-    assert classification.supported is False
-    assert "industry" in classification.sources
-    assert "statement_structure" in classification.sources
-    with pytest.raises(valuation_router.ValuationUnreliable) as exc_info:
-        valuation_router.route_valuation(fundamentals)
-    assert exc_info.value.reasons == list(classification.reasons)
+    assert classification.supported is True
+    assert len(classification.sources) >= 2
+    assert set(classification.sources) >= {"industry", "statement_structure"}
+    assert classification.reasons == ()
+    assert result == expected
+    assert calls == [fundamentals]
 
 
 def test_bank_industry_detection_does_not_depend_on_other_metadata_fields():
@@ -163,7 +183,54 @@ def test_bank_industry_detection_does_not_depend_on_other_metadata_fields():
     classification = valuation_router.classify_company(fundamentals)
 
     assert classification.company_type == "bank"
+    assert classification.supported is True
     assert classification.sources == ("industry", "statement_structure")
+
+
+def test_bank_classification_rejects_incompatible_common_equity_units(
+    monkeypatch,
+):
+    periods = []
+    for year in range(2022, 2026):
+        period = _bank_period(year)
+        periods.append(
+            period.model_copy(
+                update={
+                    "sources": {
+                        **period.sources,
+                        "common_equity": period.sources[
+                            "common_equity"
+                        ].model_copy(update={"unit": "shares"}),
+                    }
+                }
+            )
+        )
+    fundamentals = _fundamentals(
+        sector="Financial Services",
+        industry="Banks - Regional",
+        periods=periods,
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("incompatible bank must not be valued"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail("incompatible bank must not fall back"),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+
+    assert classification.company_type == "ambiguous"
+    assert classification.supported is False
+    assert any(
+        "compatible" in reason.lower() for reason in classification.reasons
+    )
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(fundamentals)
 
 
 def test_bank_metadata_without_bank_statements_is_ambiguous_and_never_falls_back(
@@ -173,6 +240,12 @@ def test_bank_metadata_without_bank_statements_is_ambiguous_and_never_falls_back
         sector="Financial Services",
         industry="Banks - Regional",
         periods=[_operating_period(year) for year in range(2023, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("ambiguous bank must not be valued"),
+        raising=False,
     )
     monkeypatch.setattr(
         valuation_router,
@@ -197,6 +270,12 @@ def test_explicit_reit_type_takes_precedence_over_bank_evidence(monkeypatch):
         sector="Financial Services",
         industry="Banks - Regional",
         periods=[_bank_period(year) for year in range(2023, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("REIT must not use bank valuation"),
+        raising=False,
     )
     monkeypatch.setattr(
         valuation_router,
@@ -248,6 +327,12 @@ def test_insurer_is_unsupported(monkeypatch):
     )
     monkeypatch.setattr(
         valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("insurer must not use bank valuation"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        valuation_router,
         "value_owner_earnings",
         lambda candidate: pytest.fail("insurer must not use owner earnings"),
     )
@@ -285,6 +370,12 @@ def test_conflicting_bank_and_operating_metadata_is_ambiguous(monkeypatch):
         sector="Technology",
         industry="Banks - Regional",
         periods=[_bank_period(year) for year in range(2023, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("ambiguous company must not use bank"),
+        raising=False,
     )
     monkeypatch.setattr(
         valuation_router,
@@ -332,6 +423,20 @@ def test_operating_classification_rejects_incompatible_fact_units(monkeypatch):
 
 def test_owner_earnings_input_failure_becomes_typed_unreliable():
     fundamentals = _fundamentals(periods=[_operating_period(2025)])
+
+    with pytest.raises(valuation_router.ValuationUnreliable) as exc_info:
+        valuation_router.route_valuation(fundamentals)
+
+    assert isinstance(exc_info.value.reasons, list)
+    assert any("three" in reason.lower() for reason in exc_info.value.reasons)
+
+
+def test_bank_input_failure_becomes_typed_unreliable():
+    fundamentals = _fundamentals(
+        sector="Financial Services",
+        industry="Banks - Regional",
+        periods=[_bank_period(year) for year in range(2024, 2026)],
+    )
 
     with pytest.raises(valuation_router.ValuationUnreliable) as exc_info:
         valuation_router.route_valuation(fundamentals)

@@ -74,6 +74,49 @@ def _valuation_response_payload(*, unreliable: bool = False):
     }
 
 
+def _bank_valuation_response_payload():
+    payload = _valuation_response_payload()
+    payload.update(
+        {
+            "symbol": "SGX:D05",
+            "detected_company_type": "bank",
+            "method": "bank_residual_income",
+            "current_price": 9.0,
+            "intrinsic_value": {
+                "bear": 9.5,
+                "base": 10.5,
+                "bull": 11.5,
+                "margin_of_safety_price": 7.875,
+                "price_to_base_value": 0.8571,
+                "upside_downside_percent": 16.6667,
+            },
+            "model_details": {
+                "method": "bank_residual_income",
+                "normalized_roe": 0.12,
+                "book_value_per_share": 10.0,
+                "payout_ratio": 0.40,
+                "usable_years": 4,
+                "projected_book_equity": {
+                    "bear": [10_100.0],
+                    "base": [10_200.0],
+                    "bull": [10_300.0],
+                },
+                "cet1_ratio": 0.14,
+                "npl_ratio": 0.02,
+                "loan_loss_coverage": 1.5,
+            },
+            "sources": {
+                "common_equity": "yfinance",
+                "cet1_ratio": "yfinance_info",
+                "npl_ratio": "yfinance_info",
+                "loan_loss_coverage": "yfinance_info",
+                "current_price": "existing_quote_provider",
+            },
+        }
+    )
+    return payload
+
+
 def test_health():
     response = client.get("/health")
 
@@ -144,6 +187,61 @@ def test_market_valuation_endpoint_returns_typed_service_response(monkeypatch):
     assert response.status_code == 200
     assert response.json()["symbol"] == "SGX:S63"
     assert response.json()["method"] == "owner_earnings_dcf"
+
+
+def test_market_bank_valuation_normalizes_both_d05_forms_and_stays_independent(
+    monkeypatch,
+):
+    from app.api.v1 import markets
+
+    valuation_calls = []
+    technical_calls = []
+
+    def fake_valuation(exchange: str, symbol: str):
+        valuation_calls.append((exchange, symbol))
+        return _bank_valuation_response_payload()
+
+    def fake_technical(
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        include_multi_timeframe: bool,
+    ):
+        technical_calls.append(
+            (exchange, symbol, timeframe, include_multi_timeframe)
+        )
+        return {
+            "symbol": "SGX:D05",
+            "timeframe": timeframe,
+            "source": "tradingview_mcp",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(
+        markets.valuation_service, "get_valuation", fake_valuation
+    )
+    monkeypatch.setattr(
+        markets.provider, "get_technical_analysis", fake_technical
+    )
+
+    bare = client.get("/api/v1/markets/SGX/D05/valuation")
+    suffixed = client.get("/api/v1/markets/SGX/D05.SI/valuation")
+    technical = client.get("/api/v1/markets/SGX/D05/technical")
+
+    assert bare.status_code == 200
+    assert suffixed.status_code == 200
+    assert bare.json() == suffixed.json()
+    payload = bare.json()
+    assert payload["symbol"] == "SGX:D05"
+    assert payload["currency"] == "SGD"
+    assert payload["method"] == "bank_residual_income"
+    assert payload["model_details"]["method"] == "bank_residual_income"
+    assert "normalized_owner_earnings" not in payload["model_details"]
+    assert "owner_earnings_per_share" not in payload["model_details"]
+    assert valuation_calls == [("SGX", "D05"), ("SGX", "D05.SI")]
+    assert technical.status_code == 200
+    assert technical.json()["source"] == "tradingview_mcp"
+    assert technical_calls == [("SGX", "D05", "1D", False)]
 
 
 def test_market_valuation_endpoint_maps_not_found_service_error(monkeypatch):

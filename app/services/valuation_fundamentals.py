@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from numbers import Real
 from threading import Event, Lock
 from time import monotonic
 
@@ -11,7 +13,11 @@ from app.services.sec_companyfacts import (
     SecCompanyFactsError,
     fetch_sec_fundamentals,
 )
-from app.services.valuation_types import FinancialPeriod, ValuationFundamentals
+from app.services.valuation_types import (
+    APPROVED_BANK_METRIC_KEYS,
+    FinancialPeriod,
+    ValuationFundamentals,
+)
 from app.services.yfinance_statements import (
     YFinanceStatementsError,
     fetch_yfinance_fundamentals,
@@ -211,19 +217,26 @@ def _fetch_uncached(
                 "STOCK_API_SEC_USER_AGENT is not configured; using yFinance "
                 "fallback fundamentals and capping confidence below high."
             )
-            return fetch_yfinance_fundamentals(exchange, symbol), (warning,)
+            fallback = fetch_yfinance_fundamentals(exchange, symbol)
+            return _normalize_bank_metrics(fallback), (warning,)
 
-        primary = fetch_sec_fundamentals(exchange, symbol)
+        primary = _normalize_bank_metrics(
+            fetch_sec_fundamentals(exchange, symbol)
+        )
         if not _needs_yfinance_fallback(primary):
             return primary, ()
         try:
-            fallback = fetch_yfinance_fundamentals(exchange, symbol)
+            fallback = _normalize_bank_metrics(
+                fetch_yfinance_fundamentals(exchange, symbol)
+            )
         except YFinanceStatementsError as exc:
             warning = f"Optional yFinance fundamentals fallback failed: {exc}"
             return primary, (warning,)
         return _merge_sec_with_yfinance(primary, fallback)
 
-    fundamentals = fetch_yfinance_fundamentals(exchange, symbol)
+    fundamentals = _normalize_bank_metrics(
+        fetch_yfinance_fundamentals(exchange, symbol)
+    )
     if exchange == "SGX":
         return fundamentals, (
             "SGX yFinance fundamentals cap valuation confidence at medium.",
@@ -243,6 +256,8 @@ def _merge_sec_with_yfinance(
     primary: ValuationFundamentals,
     fallback: ValuationFundamentals,
 ) -> tuple[ValuationFundamentals, tuple[str, ...]]:
+    primary = _normalize_bank_metrics(primary)
+    fallback = _normalize_bank_metrics(fallback)
     warnings = [*primary.warnings, *fallback.warnings]
     if (
         primary.symbol != fallback.symbol
@@ -335,6 +350,17 @@ def _merge_sec_with_yfinance(
         )
         filled_fields.add("current_diluted_shares")
 
+    bank_metrics = dict(primary.bank_metrics)
+    for metric, value in fallback.bank_metrics.items():
+        if metric in bank_metrics:
+            continue
+        bank_metrics[metric] = value
+        sources[metric] = fallback.sources.get(
+            metric, fallback.primary_source
+        )
+        filled_fields.add(metric)
+    top_level_updates["bank_metrics"] = bank_metrics
+
     for period in merged_periods:
         for field, provenance in period.sources.items():
             sources[field] = provenance.provider
@@ -352,6 +378,31 @@ def _merge_sec_with_yfinance(
     top_level_updates["missing_fields"] = _remaining_missing_fields(candidate)
     top_level_updates["warnings"] = list(_unique(warnings))
     return primary.model_copy(update=top_level_updates), _unique(warnings)
+
+
+def _normalize_bank_metrics(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    bank_metrics = {
+        key: float(value)
+        for key, value in fundamentals.bank_metrics.items()
+        if key in APPROVED_BANK_METRIC_KEYS
+        and isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    }
+    sources = dict(fundamentals.sources)
+    for metric in APPROVED_BANK_METRIC_KEYS:
+        if metric not in bank_metrics:
+            sources.pop(metric, None)
+            continue
+        source = sources.get(metric)
+        if not isinstance(source, str) or not source.strip():
+            sources[metric] = fundamentals.primary_source
+    return fundamentals.model_copy(
+        deep=True,
+        update={"bank_metrics": bank_metrics, "sources": sources},
+    )
 
 
 def _compatible_provenance(

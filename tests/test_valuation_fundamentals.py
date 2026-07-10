@@ -158,6 +158,169 @@ def test_sec_primary_keeps_existing_facts_and_fills_missing_compatible_facts(
     assert envelope.stale is False
 
 
+def test_sec_facade_merges_only_explicit_approved_bank_metrics_with_sources(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        bank_metrics={"cet1_ratio": 0.14},
+        missing_fields=["operating_cash_flow"],
+        periods=[_period(period_end, common_equity=10_000.0)],
+        sources={
+            "financial_statements": "sec_companyfacts",
+            "cet1_ratio": "sec_companyfacts",
+        },
+    )
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        bank_metrics={
+            "cet1_ratio": 0.99,
+            "npl_ratio": 0.02,
+            "loan_loss_coverage": 1.5,
+            "regulatory_capital_headroom": 0.03,
+        },
+        periods=[
+            _period(
+                period_end,
+                provider="yfinance",
+                operating_cash_flow=100.0,
+            )
+        ],
+        sources={
+            "financial_statements": "yfinance",
+            "cet1_ratio": "yfinance_cet1",
+            "npl_ratio": "yfinance_npl",
+            "loan_loss_coverage": "yfinance_coverage",
+            "regulatory_capital_headroom": "yfinance_headroom",
+        },
+    )
+    yahoo.bank_metrics["tier1_ratio"] = 0.16
+    yahoo.sources["tier1_ratio"] = "yfinance_unapproved"
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "NASDAQ", "BANK"
+    ).fundamentals
+
+    assert merged.bank_metrics == {
+        "cet1_ratio": 0.14,
+        "npl_ratio": 0.02,
+        "loan_loss_coverage": 1.5,
+        "regulatory_capital_headroom": 0.03,
+    }
+    assert merged.sources["cet1_ratio"] == "sec_companyfacts"
+    assert merged.sources["npl_ratio"] == "yfinance_npl"
+    assert merged.sources["loan_loss_coverage"] == "yfinance_coverage"
+    assert (
+        merged.sources["regulatory_capital_headroom"]
+        == "yfinance_headroom"
+    )
+    assert "tier1_ratio" not in merged.bank_metrics
+    assert "tier1_ratio" not in merged.sources
+
+
+def test_sec_facade_does_not_merge_bank_metrics_across_currencies(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        missing_fields=["operating_cash_flow"],
+        periods=[_period(period_end, common_equity=10_000.0)],
+    )
+    yahoo = _fundamentals(
+        currency="SGD",
+        primary_source="yfinance_fallback",
+        bank_metrics={"cet1_ratio": 0.14, "npl_ratio": 0.02},
+        periods=[
+            _period(
+                period_end,
+                currency="SGD",
+                provider="yfinance",
+                total_assets=100_000.0,
+            )
+        ],
+        sources={
+            "financial_statements": "yfinance",
+            "cet1_ratio": "yfinance_info",
+            "npl_ratio": "yfinance_info",
+        },
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "NASDAQ", "BANK"
+    ).fundamentals
+
+    assert merged.bank_metrics == {}
+    assert "cet1_ratio" not in merged.sources
+    assert "npl_ratio" not in merged.sources
+
+
+def test_sec_facade_never_infers_bank_metrics_from_balance_sheet_rows(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        missing_fields=["operating_cash_flow"],
+        periods=[_period(period_end, common_equity=10_000.0)],
+    )
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        periods=[
+            _period(
+                period_end,
+                provider="yfinance",
+                total_assets=100_000.0,
+                total_debt=80_000.0,
+            )
+        ],
+        sources={
+            "financial_statements": "yfinance",
+            "cet1_ratio": "unrelated_provider_metadata",
+            "npl_ratio": "unrelated_provider_metadata",
+        },
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "NASDAQ", "BANK"
+    ).fundamentals
+
+    assert merged.bank_metrics == {}
+    assert "cet1_ratio" not in merged.sources
+    assert "npl_ratio" not in merged.sources
+
+
 @pytest.mark.parametrize(
     ("fallback_currency", "fallback_period_end"),
     [

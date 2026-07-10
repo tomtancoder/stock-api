@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.services.bank_valuation import value_bank
 from app.services.owner_earnings_valuation import value_owner_earnings
 from app.services.valuation_types import (
     FinancialPeriod,
@@ -129,9 +130,9 @@ def classify_company(
             )
         return CompanyClassification(
             company_type="bank",
-            supported=False,
+            supported=True,
             sources=_unique((*bank_sources, "statement_structure")),
-            reasons=("Bank valuation is recognized but not supported yet.",),
+            reasons=(),
         )
 
     if not _has_compatible_operating_statements(fundamentals):
@@ -158,12 +159,14 @@ def classify_company(
 
 def route_valuation(fundamentals: ValuationFundamentals) -> ModelResult:
     classification = classify_company(fundamentals)
-    if not classification.supported or classification.company_type != (
-        "operating_company"
-    ):
+    if not classification.supported:
         raise ValuationUnreliable(classification.reasons)
     try:
-        return value_owner_earnings(fundamentals)
+        if classification.company_type == "bank":
+            return value_bank(fundamentals)
+        if classification.company_type == "operating_company":
+            return value_owner_earnings(fundamentals)
+        raise ValuationUnreliable(classification.reasons)
     except ValueError as exc:
         raise ValuationUnreliable([str(exc)]) from exc
 

@@ -1,15 +1,18 @@
+import math
 from datetime import date, datetime, timedelta, timezone
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
 
-from app.services import valuation_service
+from app.schemas import BankValuationDetails
+from app.services import bank_valuation, valuation_router, valuation_service
 from app.services.sec_companyfacts import SecCompanyFactsError
 from app.services.tradingview_provider import TradingViewProviderError
 from app.services.valuation_fundamentals import FundamentalsEnvelope
 from app.services.valuation_router import CompanyClassification, ValuationUnreliable
 from app.services.valuation_types import (
+    FactProvenance,
     FinancialPeriod,
     ModelResult,
     ValuationFundamentals,
@@ -70,6 +73,77 @@ def _fundamentals(
         },
         missing_fields=missing_fields or [],
         warnings=warnings or [],
+    )
+
+
+def _bank_fundamentals() -> ValuationFundamentals:
+    equities = [8_000.0, 8_500.0, 9_000.0, 9_500.0, 10_000.0]
+    periods = []
+    for index, equity in enumerate(equities):
+        year = 2021 + index
+        period_end = date(year, 12, 31)
+        net_income = (
+            None
+            if index == 0
+            else ((equities[index - 1] + equity) / 2.0) * 0.12
+        )
+        facts = {
+            "common_equity": equity,
+            "net_income_common": net_income,
+            "common_dividends": (
+                None if net_income is None else -(net_income * 0.40)
+            ),
+            "diluted_shares": 1_000.0,
+            "total_assets": equity * 10.0,
+        }
+        periods.append(
+            FinancialPeriod(
+                period_end=period_end,
+                fiscal_year=year,
+                currency="SGD",
+                sources={
+                    field: FactProvenance(
+                        provider="yfinance",
+                        concept=field,
+                        period_end=period_end,
+                        unit=(
+                            "shares" if field == "diluted_shares" else "SGD"
+                        ),
+                    )
+                    for field, value in facts.items()
+                    if value is not None
+                },
+                **facts,
+            )
+        )
+    metrics = {
+        "cet1_ratio": 0.14,
+        "npl_ratio": 0.02,
+        "loan_loss_coverage": 1.5,
+        "regulatory_capital_headroom": 0.03,
+    }
+    return ValuationFundamentals(
+        symbol="SGX:D05",
+        exchange="SGX",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        provider_security_type="EQUITY",
+        sector="Financial Services",
+        industry="Banks - Regional",
+        issuer_classification="Commercial Banking",
+        current_diluted_shares=1_000.0,
+        bank_metrics=metrics,
+        periods=periods,
+        fetched_at=FETCHED_AT,
+        sources={
+            "financial_statements": "yfinance",
+            "current_diluted_shares": "yfinance",
+            "cet1_ratio": "yfinance_info",
+            "npl_ratio": "yfinance_info",
+            "loan_loss_coverage": "yfinance_info",
+            "regulatory_capital_headroom": "yfinance_info",
+        },
+        warnings=["bank fundamentals warning"],
     )
 
 
@@ -269,6 +343,105 @@ def test_service_builds_typed_owner_earnings_response(monkeypatch, fake_clock):
         "model warning",
         "quote warning",
     ]
+
+
+def test_service_normalizes_both_d05_forms_to_typed_bank_response(
+    monkeypatch, fake_clock
+):
+    fundamentals = _bank_fundamentals()
+    envelope = _envelope(
+        fundamentals,
+        warnings=(
+            "SGX yFinance fundamentals cap valuation confidence at medium.",
+        ),
+    )
+    fundamentals_calls = []
+    quote_calls = []
+    bank_calls = []
+
+    def get_fundamentals(exchange: str, symbol: str) -> FundamentalsEnvelope:
+        fundamentals_calls.append((exchange, symbol))
+        return envelope
+
+    def get_quote(exchange: str, symbol: str) -> dict[str, object]:
+        quote_calls.append((exchange, symbol))
+        return _quote(currency="SGD", price=9.0)
+
+    def value_bank(candidate: ValuationFundamentals) -> ModelResult:
+        bank_calls.append(candidate)
+        return bank_valuation.value_bank(candidate)
+
+    monkeypatch.setattr(
+        valuation_service, "get_fundamentals", get_fundamentals
+    )
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider, "get_quote", get_quote
+    )
+    monkeypatch.setattr(
+        valuation_router, "value_bank", value_bank, raising=False
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail("a bank must never use owner earnings"),
+    )
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
+    )
+
+    bare = valuation_service.get_valuation("SGX", "D05")
+    suffixed = valuation_service.get_valuation("SGX", "D05.SI")
+
+    assert bare.model_dump() == suffixed.model_dump()
+    assert bare.symbol == "SGX:D05"
+    assert bare.exchange == "SGX"
+    assert bare.currency == "SGD"
+    assert bare.detected_company_type == "bank"
+    assert bare.method == "bank_residual_income"
+    assert bare.confidence == "medium"
+    assert bare.intrinsic_value is not None
+    values = (
+        bare.intrinsic_value.bear,
+        bare.intrinsic_value.base,
+        bare.intrinsic_value.bull,
+    )
+    assert all(math.isfinite(value) and value > 0 for value in values)
+    assert values[0] <= values[1] <= values[2]
+    assert bare.model_details is not None
+    assert isinstance(bare.model_details, BankValuationDetails)
+    details = bare.model_details.model_dump()
+    assert details["method"] == "bank_residual_income"
+    assert details["normalized_roe"] == pytest.approx(0.12)
+    assert details["book_value_per_share"] == 10.0
+    assert details["payout_ratio"] == pytest.approx(0.40)
+    assert details["usable_years"] == 4
+    assert details["cet1_ratio"] == 0.14
+    assert details["npl_ratio"] == 0.02
+    assert details["loan_loss_coverage"] == 1.5
+    assert "normalized_owner_earnings" not in details
+    assert "owner_earnings_per_share" not in details
+    assert "annual_history" not in details
+    for metric in (
+        "cet1_ratio",
+        "npl_ratio",
+        "loan_loss_coverage",
+        "regulatory_capital_headroom",
+    ):
+        assert bare.sources[metric] == "yfinance_info"
+    assert bare.warnings == [
+        "bank fundamentals warning",
+        "SGX yFinance fundamentals cap valuation confidence at medium.",
+        "quote warning",
+    ]
+    assert fundamentals_calls == [("SGX", "D05"), ("SGX", "D05")]
+    assert quote_calls == [("SGX", "D05")]
+    assert bank_calls == [fundamentals]
+
+
+def test_bank_model_uses_cache_version_two():
+    assert valuation_service.VALUATION_MODEL_VERSION == "2"
 
 
 @pytest.mark.parametrize(
@@ -606,7 +779,7 @@ def test_fundamentals_timestamp_and_model_version_only_invalidate_model_cache(
     first_key = next(iter(valuation_service._MODEL_CACHE))
     assert first_key == (
         "NASDAQ:ACME",
-        "1",
+        "2",
         FETCHED_AT.isoformat(),
     )
     changed = first_fundamentals.model_copy(
@@ -618,16 +791,16 @@ def test_fundamentals_timestamp_and_model_version_only_invalidate_model_cache(
     changed_key = next(iter(valuation_service._MODEL_CACHE))
     assert changed_key == (
         "NASDAQ:ACME",
-        "1",
+        "2",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
-    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "2")
+    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "3")
     valuation_service.get_valuation("NASDAQ", "ACME")
     assert len(valuation_service._MODEL_CACHE) == 1
     version_key = next(iter(valuation_service._MODEL_CACHE))
     assert version_key == (
         "NASDAQ:ACME",
-        "2",
+        "3",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
     assert valuation_service._MODEL_CURRENT_KEYS == {
@@ -1101,7 +1274,7 @@ def test_repeated_fundamentals_changes_keep_one_model_entry_per_identity(
 
         expected_key = (
             "NASDAQ:ACME",
-            "1",
+            "2",
             fetched_at.isoformat(),
         )
         assert list(valuation_service._MODEL_CACHE) == [expected_key]
@@ -1215,7 +1388,7 @@ def test_slow_old_model_sibling_cannot_replace_newer_current_key(
 
     newer_key = (
         "NASDAQ:ACME",
-        "1",
+        "2",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
     assert not old_owner.is_alive()
@@ -1271,7 +1444,7 @@ def test_older_fundamentals_request_is_non_promoting_after_newer_cache(
     )
     newer_key = (
         "NASDAQ:ACME",
-        "1",
+        "2",
         newer_fetched_at.isoformat(),
     )
     old_caller = Thread(
@@ -1356,7 +1529,7 @@ def test_old_model_version_completion_is_non_promoting(
     old_caller.start()
     assert old_started.wait(2), "old model version did not start"
 
-    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "2")
+    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "3")
     release_old.set()
     old_caller.join(2)
     cache_after_old_completion = dict(valuation_service._MODEL_CACHE)
@@ -1372,7 +1545,7 @@ def test_old_model_version_completion_is_non_promoting(
 
     current_key = (
         "NASDAQ:ACME",
-        "2",
+        "3",
         FETCHED_AT.isoformat(),
     )
     assert not old_caller.is_alive()

@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -101,6 +101,24 @@ class OwnerEarningsValuationDetails(BaseModel):
     usable_years: int
 
 
+class BankValuationDetails(BaseModel):
+    method: Literal["bank_residual_income"]
+    normalized_roe: float
+    book_value_per_share: float
+    payout_ratio: float
+    usable_years: int
+    projected_book_equity: dict[str, list[float]]
+    cet1_ratio: float | None = None
+    npl_ratio: float | None = None
+    loan_loss_coverage: float | None = None
+
+
+ValuationModelDetails = Annotated[
+    OwnerEarningsValuationDetails | BankValuationDetails,
+    Field(discriminator="method"),
+]
+
+
 class ValuationResponse(BaseModel):
     symbol: str
     exchange: str
@@ -119,7 +137,7 @@ class ValuationResponse(BaseModel):
     current_price: float = Field(gt=0, allow_inf_nan=False)
     price_as_of: datetime
     intrinsic_value: IntrinsicValueRange | None = None
-    model_details: OwnerEarningsValuationDetails | None = None
+    model_details: ValuationModelDetails | None = None
     quality: ValuationQuality
     assumptions: dict[str, Any] = Field(default_factory=dict)
     data_quality: ValuationDataQuality

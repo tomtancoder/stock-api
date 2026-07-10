@@ -28,7 +28,7 @@ from app.services.valuation_types import ModelResult, ValuationFundamentals
 from app.services.yfinance_statements import YFinanceStatementsError
 
 
-VALUATION_MODEL_VERSION = "1"
+VALUATION_MODEL_VERSION = "2"
 
 
 class ValuationServiceError(RuntimeError):
