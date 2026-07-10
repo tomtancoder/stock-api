@@ -85,6 +85,7 @@ _QuoteCacheKey = tuple[str, str]
 
 _MODEL_CACHE: dict[_ModelCacheKey, _ModelCacheEntry] = {}
 _MODEL_IN_FLIGHT: dict[_ModelCacheKey, _ModelFlight] = {}
+_MODEL_CURRENT_KEYS: dict[str, _ModelCacheKey] = {}
 _MODEL_GENERATION = 0
 _MODEL_CACHE_LOCK = Lock()
 _QUOTE_CACHE: dict[_QuoteCacheKey, _QuoteCacheEntry] = {}
@@ -240,14 +241,23 @@ def _get_model_result(
         fetched_at.isoformat(),
     )
     fresh_until = _as_utc(envelope.fresh_until)
+    lookup_time = now
     flight: _ModelFlight
     while True:
         with _MODEL_CACHE_LOCK:
+            _prune_expired_model_entries(lookup_time)
+            current_key = _MODEL_CURRENT_KEYS.get(public_symbol)
+            if current_key != key:
+                _MODEL_CURRENT_KEYS[public_symbol] = key
+                for sibling_key in tuple(_MODEL_CACHE):
+                    if (
+                        sibling_key[0] == public_symbol
+                        and sibling_key != key
+                    ):
+                        del _MODEL_CACHE[sibling_key]
             cached = _MODEL_CACHE.get(key)
-            if cached is not None and now < cached.fresh_until:
-                return cached.result.model_copy(deep=True)
             if cached is not None:
-                del _MODEL_CACHE[key]
+                return cached.result.model_copy(deep=True)
             flight = _MODEL_IN_FLIGHT.get(key)
             if flight is None:
                 flight = _ModelFlight(
@@ -260,6 +270,7 @@ def _get_model_result(
             return flight.result.model_copy(deep=True)
         if flight.error is not None:
             raise flight.error
+        lookup_time = _utc_now()
 
     try:
         result = route_valuation(fundamentals)
@@ -282,13 +293,18 @@ def _complete_successful_model(
 ) -> ModelResult:
     shared_result = result.model_copy(deep=True)
     with _MODEL_CACHE_LOCK:
-        owns_generation = (
-            _MODEL_IN_FLIGHT.get(key) is flight
+        owns_flight = _MODEL_IN_FLIGHT.get(key) is flight
+        may_store = (
+            owns_flight
             and flight.generation == _MODEL_GENERATION
+            and _MODEL_CURRENT_KEYS.get(key[0]) == key
         )
-        if owns_generation:
+        if may_store:
             if entry is not None:
                 _MODEL_CACHE[key] = entry
+            elif _MODEL_CURRENT_KEYS.get(key[0]) == key:
+                del _MODEL_CURRENT_KEYS[key[0]]
+        if owns_flight:
             del _MODEL_IN_FLIGHT[key]
         flight.result = shared_result
         flight.event.set()
@@ -303,9 +319,20 @@ def _complete_failed_model(
     with _MODEL_CACHE_LOCK:
         if _MODEL_IN_FLIGHT.get(key) is flight:
             del _MODEL_IN_FLIGHT[key]
+            if _MODEL_CURRENT_KEYS.get(key[0]) == key:
+                del _MODEL_CURRENT_KEYS[key[0]]
         flight.error = exc
         flight.event.set()
     raise exc
+
+
+def _prune_expired_model_entries(now: datetime) -> None:
+    for cached_key, entry in tuple(_MODEL_CACHE.items()):
+        if now < entry.fresh_until:
+            continue
+        del _MODEL_CACHE[cached_key]
+        if _MODEL_CURRENT_KEYS.get(cached_key[0]) == cached_key:
+            del _MODEL_CURRENT_KEYS[cached_key[0]]
 
 
 def _get_quote(
@@ -559,6 +586,7 @@ def _clear_valuation_caches() -> None:
         with _QUOTE_CACHE_LOCK:
             _MODEL_CACHE.clear()
             _QUOTE_CACHE.clear()
+            _MODEL_CURRENT_KEYS.clear()
             _MODEL_GENERATION += 1
             _QUOTE_GENERATION += 1
             model_flights = tuple(_MODEL_IN_FLIGHT.values())

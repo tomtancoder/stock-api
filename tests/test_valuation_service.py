@@ -602,13 +602,37 @@ def test_fundamentals_timestamp_and_model_version_only_invalidate_model_cache(
     )
 
     valuation_service.get_valuation("NASDAQ", "ACME")
+    assert len(valuation_service._MODEL_CACHE) == 1
+    first_key = next(iter(valuation_service._MODEL_CACHE))
+    assert first_key == (
+        "NASDAQ:ACME",
+        "1",
+        FETCHED_AT.isoformat(),
+    )
     changed = first_fundamentals.model_copy(
         update={"fetched_at": FETCHED_AT + timedelta(seconds=1)}, deep=True
     )
     envelope_box[0] = _envelope(changed)
     valuation_service.get_valuation("NASDAQ", "ACME")
+    assert len(valuation_service._MODEL_CACHE) == 1
+    changed_key = next(iter(valuation_service._MODEL_CACHE))
+    assert changed_key == (
+        "NASDAQ:ACME",
+        "1",
+        (FETCHED_AT + timedelta(seconds=1)).isoformat(),
+    )
     monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "2")
     valuation_service.get_valuation("NASDAQ", "ACME")
+    assert len(valuation_service._MODEL_CACHE) == 1
+    version_key = next(iter(valuation_service._MODEL_CACHE))
+    assert version_key == (
+        "NASDAQ:ACME",
+        "2",
+        (FETCHED_AT + timedelta(seconds=1)).isoformat(),
+    )
+    assert valuation_service._MODEL_CURRENT_KEYS == {
+        "NASDAQ:ACME": version_key
+    }
 
     assert model_calls == 3
     assert quote_calls == 1
@@ -1051,3 +1075,157 @@ def test_post_clear_model_generation_wins_over_slow_old_owner(
     assert cached.base == 20.0
     assert calls == 2
     assert valuation_service._MODEL_IN_FLIGHT == {}
+
+
+def test_repeated_fundamentals_changes_keep_one_model_entry_per_identity(
+    monkeypatch, fake_clock
+):
+    calls = 0
+
+    def route(candidate):
+        nonlocal calls
+        calls += 1
+        return _model_result()
+
+    monkeypatch.setattr(valuation_service, "route_valuation", route)
+
+    for day in range(10):
+        fetched_at = FETCHED_AT + timedelta(days=day)
+        fundamentals = _fundamentals(fetched_at=fetched_at)
+        valuation_service._get_model_result(
+            "NASDAQ:ACME",
+            fundamentals,
+            _envelope(fundamentals),
+            NOW,
+        )
+
+        expected_key = (
+            "NASDAQ:ACME",
+            "1",
+            fetched_at.isoformat(),
+        )
+        assert list(valuation_service._MODEL_CACHE) == [expected_key]
+        assert valuation_service._MODEL_CURRENT_KEYS == {
+            "NASDAQ:ACME": expected_key
+        }
+
+    assert calls == 10
+
+
+def test_model_cache_access_prunes_expired_unrelated_entries(
+    monkeypatch, fake_clock
+):
+    monkeypatch.setattr(
+        valuation_service,
+        "route_valuation",
+        lambda candidate: _model_result(),
+    )
+    old_fundamentals = _fundamentals(
+        exchange="NYSE",
+        symbol="NYSE:OLD",
+    )
+    old_envelope = _envelope(
+        old_fundamentals,
+        fresh_until=NOW + timedelta(seconds=1),
+    )
+    valuation_service._get_model_result(
+        "NYSE:OLD", old_fundamentals, old_envelope, NOW
+    )
+    assert len(valuation_service._MODEL_CACHE) == 1
+
+    fake_clock.wall[0] = NOW + timedelta(seconds=2)
+    current_fundamentals = _fundamentals()
+    valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        current_fundamentals,
+        _envelope(current_fundamentals),
+        fake_clock.wall[0],
+    )
+
+    assert len(valuation_service._MODEL_CACHE) == 1
+    current_key = next(iter(valuation_service._MODEL_CACHE))
+    assert current_key[0] == "NASDAQ:ACME"
+    assert "NYSE:OLD" not in valuation_service._MODEL_CURRENT_KEYS
+
+
+def test_slow_old_model_sibling_cannot_replace_newer_current_key(
+    monkeypatch, fake_clock
+):
+    old_fundamentals = _fundamentals()
+    new_fundamentals = old_fundamentals.model_copy(
+        deep=True,
+        update={"fetched_at": FETCHED_AT + timedelta(seconds=1)},
+    )
+    old_result = _model_result()
+    new_result = _model_result().model_copy(
+        deep=True,
+        update={"bear": 10.0, "base": 20.0, "bull": 30.0},
+    )
+    old_started = Event()
+    release_old = Event()
+    calls = 0
+    calls_lock = Lock()
+    old_results = []
+    old_errors: list[BaseException] = []
+
+    def ordered_model(candidate):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            old_started.set()
+            assert release_old.wait(2), "test did not release old sibling"
+            return old_result
+        if call_number == 2:
+            return new_result
+        pytest.fail("newer sibling was not reused from cache")
+
+    monkeypatch.setattr(valuation_service, "route_valuation", ordered_model)
+    old_owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_model_result(
+                "NASDAQ:ACME",
+                old_fundamentals,
+                _envelope(old_fundamentals),
+                NOW,
+            ),
+            old_results,
+            old_errors,
+        ),
+    )
+    old_owner.start()
+    assert old_started.wait(2), "old sibling did not start"
+
+    newer = valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        new_fundamentals,
+        _envelope(new_fundamentals),
+        NOW,
+    )
+    release_old.set()
+    old_owner.join(2)
+    cached = valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        new_fundamentals,
+        _envelope(new_fundamentals),
+        NOW,
+    )
+
+    newer_key = (
+        "NASDAQ:ACME",
+        "1",
+        (FETCHED_AT + timedelta(seconds=1)).isoformat(),
+    )
+    assert not old_owner.is_alive()
+    assert old_errors == []
+    assert old_results[0].base == 7.5
+    assert newer.base == 20.0
+    assert cached.base == 20.0
+    assert list(valuation_service._MODEL_CACHE) == [newer_key]
+    assert valuation_service._MODEL_CURRENT_KEYS == {
+        "NASDAQ:ACME": newer_key
+    }
+    assert valuation_service._MODEL_IN_FLIGHT == {}
+    assert calls == 2
