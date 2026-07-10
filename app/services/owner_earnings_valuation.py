@@ -30,19 +30,59 @@ def _positive_finite(value: float | None) -> bool:
     return value is not None and math.isfinite(float(value)) and value > 0
 
 
-def normalize_owner_earnings(fundamentals: ValuationFundamentals) -> float:
+def _select_periods(
+    fundamentals: ValuationFundamentals,
+) -> tuple[list[FinancialPeriod], FinancialPeriod | None]:
+    annual_by_year: dict[int, tuple[int, FinancialPeriod]] = {}
+    trailing_candidates: list[tuple[int, FinancialPeriod]] = []
+    for input_index, period in enumerate(fundamentals.periods):
+        if period.is_ttm:
+            trailing_candidates.append((input_index, period))
+            continue
+        year_key = (
+            period.fiscal_year
+            if period.fiscal_year is not None
+            else period.period_end.year
+        )
+        current = annual_by_year.get(year_key)
+        if current is None or (period.period_end, input_index) >= (
+            current[1].period_end,
+            current[0],
+        ):
+            annual_by_year[year_key] = (input_index, period)
+
+    annual_periods = sorted(
+        (period for _, period in annual_by_year.values()),
+        key=lambda period: period.period_end,
+    )
+    latest_trailing = (
+        max(
+            trailing_candidates,
+            key=lambda candidate: (candidate[1].period_end, candidate[0]),
+        )[1]
+        if trailing_candidates
+        else None
+    )
+    return annual_periods, latest_trailing
+
+
+def _normalize_owner_earnings(
+    fundamentals: ValuationFundamentals,
+    annual_periods: list[FinancialPeriod],
+    trailing_period: FinancialPeriod | None,
+) -> float:
     currency = fundamentals.currency.strip().upper()
     if any(
         period.currency.strip().upper() != currency
-        for period in fundamentals.periods
+        for period in [
+            *annual_periods,
+            *([trailing_period] if trailing_period is not None else []),
+        ]
     ):
         raise ValueError("owner earnings periods must use the valuation currency")
 
     annual_owner_earnings = []
-    for period in sorted(
-        (period for period in fundamentals.periods if not period.is_ttm),
-        key=lambda period: period.period_end,
-    ):
+    for period in annual_periods:
         owner_earnings = calculate_period_owner_earnings(period)
         if _positive_finite(owner_earnings):
             annual_owner_earnings.append((period, float(owner_earnings)))
@@ -62,38 +102,40 @@ def normalize_owner_earnings(fundamentals: ValuationFundamentals) -> float:
         / 6.0
     )
 
-    trailing_periods = sorted(
-        (period for period in fundamentals.periods if period.is_ttm),
-        key=lambda period: period.period_end,
+    trailing_owner_earnings = (
+        calculate_period_owner_earnings(trailing_period)
+        if trailing_period is not None
+        else None
     )
-    usable_trailing_owner_earnings = [
-        owner_earnings
-        for period in trailing_periods
-        if _positive_finite(
-            owner_earnings := calculate_period_owner_earnings(period)
-        )
-    ]
-    if usable_trailing_owner_earnings:
-        components.append(float(usable_trailing_owner_earnings[-1]))
+    if _positive_finite(trailing_owner_earnings):
+        components.append(float(trailing_owner_earnings))
 
     margin_history = [
         owner_earnings / float(period.revenue)
         for period, owner_earnings in annual_owner_earnings
         if _positive_finite(period.revenue)
     ]
-    trailing_revenues = [
-        float(period.revenue)
-        for period in trailing_periods
-        if _positive_finite(period.revenue)
-    ]
-    if len(margin_history) >= 5 and trailing_revenues:
-        components.append(median(margin_history[-5:]) * trailing_revenues[-1])
+    trailing_revenue = (
+        float(trailing_period.revenue)
+        if trailing_period is not None
+        and _positive_finite(trailing_period.revenue)
+        else None
+    )
+    if len(margin_history) >= 5 and trailing_revenue is not None:
+        components.append(median(margin_history[-5:]) * trailing_revenue)
 
     if len(components) < 2:
         raise ValueError(
             "owner earnings normalization requires two independent components"
         )
     return float(median(components))
+
+
+def normalize_owner_earnings(fundamentals: ValuationFundamentals) -> float:
+    annual_periods, trailing_period = _select_periods(fundamentals)
+    return _normalize_owner_earnings(
+        fundamentals, annual_periods, trailing_period
+    )
 
 
 def _cagr_candidate(
@@ -111,11 +153,7 @@ def _cagr_candidate(
     return candidate if math.isfinite(candidate) else None
 
 
-def _derive_growth(fundamentals: ValuationFundamentals) -> float:
-    annual_periods = sorted(
-        (period for period in fundamentals.periods if not period.is_ttm),
-        key=lambda period: period.period_end,
-    )
+def _derive_growth(annual_periods: list[FinancialPeriod]) -> float:
     revenue_per_share = [
         (period, float(period.revenue) / float(period.diluted_shares))
         for period in annual_periods
@@ -179,12 +217,11 @@ def _scenario_value(
     return round(present_value / diluted_shares, 4)
 
 
-def _annual_history(fundamentals: ValuationFundamentals) -> list[dict[str, object]]:
+def _annual_history(
+    annual_periods: list[FinancialPeriod],
+) -> list[dict[str, object]]:
     history = []
-    for period in sorted(
-        (period for period in fundamentals.periods if not period.is_ttm),
-        key=lambda period: period.period_end,
-    ):
+    for period in annual_periods:
         owner_earnings = calculate_period_owner_earnings(period)
         if owner_earnings is None or not math.isfinite(owner_earnings):
             continue
@@ -211,8 +248,11 @@ def value_owner_earnings(fundamentals: ValuationFundamentals) -> ModelResult:
     if not _positive_finite(fundamentals.current_diluted_shares):
         raise ValueError("owner earnings valuation requires positive diluted shares")
 
-    normalized_owner_earnings = normalize_owner_earnings(fundamentals)
-    base_growth = _derive_growth(fundamentals)
+    annual_periods, trailing_period = _select_periods(fundamentals)
+    normalized_owner_earnings = _normalize_owner_earnings(
+        fundamentals, annual_periods, trailing_period
+    )
+    base_growth = _derive_growth(annual_periods)
     bear_growth = max(-0.20, base_growth - 0.04)
     bull_growth = min(0.15, base_growth + 0.03)
     scenarios = (
@@ -251,7 +291,7 @@ def value_owner_earnings(fundamentals: ValuationFundamentals) -> ModelResult:
         scenario_values["bull"],
     )
 
-    history = _annual_history(fundamentals)
+    history = _annual_history(annual_periods)
     usable_years = sum(entry["owner_earnings"] > 0 for entry in history)
     return ModelResult(
         method="owner_earnings_dcf",

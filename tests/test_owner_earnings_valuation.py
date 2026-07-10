@@ -177,6 +177,29 @@ def test_normalized_owner_earnings_requires_three_positive_annual_periods(
         normalize_owner_earnings(fundamentals_factory([*annual, ttm]))
 
 
+def test_duplicate_fiscal_years_do_not_satisfy_annual_history_gate(
+    period_factory, fundamentals_factory
+):
+    duplicates = [
+        owner_earnings_period(
+            period_factory,
+            2025,
+            owner_earnings,
+            fiscal_year=2025,
+            period_end=period_end,
+        )
+        for owner_earnings, period_end in (
+            (800.0, date(2025, 3, 31)),
+            (900.0, date(2025, 6, 30)),
+            (1_000.0, date(2025, 12, 31)),
+        )
+    ]
+    ttm = owner_earnings_period(period_factory, 2026, 1_100.0, is_ttm=True)
+
+    with pytest.raises(ValueError, match="three positive"):
+        normalize_owner_earnings(fundamentals_factory([*duplicates, ttm]))
+
+
 def test_normalized_owner_earnings_rejects_incompatible_currencies(
     period_factory, fundamentals_factory
 ):
@@ -189,6 +212,30 @@ def test_normalized_owner_earnings_rejects_incompatible_currencies(
 
     with pytest.raises(ValueError, match="currency"):
         normalize_owner_earnings(fundamentals_factory([*annual, ttm]))
+
+
+def test_later_duplicate_fiscal_year_drives_growth_history_and_usable_years(
+    period_factory, stable_fundamentals
+):
+    superseded = owner_earnings_period(
+        period_factory,
+        2021,
+        100.0,
+        fiscal_year=2021,
+        period_end=date(2021, 6, 30),
+        revenue=1_000.0,
+    )
+    fundamentals = stable_fundamentals.model_copy(
+        update={"periods": [*stable_fundamentals.periods, superseded]}
+    )
+
+    result = value_owner_earnings(fundamentals)
+
+    assert result.details["derived_growth"] == pytest.approx(0.04)
+    assert result.details["usable_years"] == 5
+    assert len(result.details["annual_history"]) == 5
+    assert result.details["annual_history"][0]["period_end"] == date(2021, 12, 31)
+    assert result.details["annual_history"][0]["owner_earnings"] == 1_000.0
 
 
 def test_owner_earnings_model_returns_finite_ordered_scenarios(stable_fundamentals):
