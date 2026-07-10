@@ -424,11 +424,19 @@ A successful `SGX:D05` response uses the same common envelope as an ordinary-com
   "currency": "SGD",
   "detected_company_type": "bank",
   "method": "bank_residual_income",
+  "status": "fair",
   "confidence": "medium",
+  "current_price": 11.8,
+  "price_as_of": "2026-07-10T10:15:00Z",
   "intrinsic_value": {
     "bear": 10.25,
     "base": 12.4,
-    "bull": 14.8
+    "bull": 14.8,
+    "margin_of_safety_price": 9.3,
+    "price_to_base_value": 0.9516,
+    "upside_downside_percent": 5.08,
+    "price_to_margin_of_safety": 1.2688,
+    "upside_to_base_pct": 5.08
   },
   "model_details": {
     "method": "bank_residual_income",
@@ -445,8 +453,14 @@ A successful `SGX:D05` response uses the same common envelope as an ordinary-com
     "npl_ratio": null,
     "loan_loss_coverage": null
   },
+  "quality": {
+    "eligible": true,
+    "reasons": [],
+    "details": {"usable_years": 5}
+  },
   "data_quality": {
     "primary_source": "yfinance_sgx",
+    "valuation_as_of": "2026-07-10T10:15:00Z",
     "stale": false,
     "missing_fields": []
   },
@@ -621,6 +635,7 @@ This illustrative `SGX:S63` response demonstrates the public symbol and SGD cont
   "status": "fair",
   "confidence": "medium",
   "current_price": 7.15,
+  "price_as_of": "2026-07-10T10:15:00Z",
   "intrinsic_value": {
     "bear": 5.8,
     "base": 7.5,
@@ -629,8 +644,23 @@ This illustrative `SGX:S63` response demonstrates the public symbol and SGD cont
     "price_to_base_value": 0.9533,
     "upside_downside_percent": 4.9
   },
+  "model_details": {
+    "method": "owner_earnings_dcf",
+    "normalized_owner_earnings": 500000000.0,
+    "owner_earnings_per_share": 0.5,
+    "maintenance_capex_method": "total_capital_expenditure",
+    "annual_history": [],
+    "derived_growth": 0.03,
+    "usable_years": 5
+  },
+  "quality": {
+    "eligible": true,
+    "reasons": [],
+    "details": {"usable_years": 5}
+  },
   "data_quality": {
     "primary_source": "yfinance_sgx",
+    "valuation_as_of": "2026-07-10T10:15:00Z",
     "stale": false,
     "missing_fields": []
   },
@@ -655,6 +685,7 @@ This illustrative `SGX:C38U` response shows the complete DPU-and-NAV method; val
   "status": "cheap",
   "confidence": "medium",
   "current_price": 1.85,
+  "price_as_of": "2026-07-10T10:15:00Z",
   "intrinsic_value": {
     "bear": 1.9,
     "base": 2.2,
@@ -681,8 +712,14 @@ This illustrative `SGX:C38U` response shows the complete DPU-and-NAV method; val
       "bull": 1.55
     }
   },
+  "quality": {
+    "eligible": true,
+    "reasons": [],
+    "details": {"usable_years": 5}
+  },
   "data_quality": {
     "primary_source": "yfinance_sgx",
+    "valuation_as_of": "2026-07-10T10:15:00Z",
     "stale": false,
     "missing_fields": []
   },
