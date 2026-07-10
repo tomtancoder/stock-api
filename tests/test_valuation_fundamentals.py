@@ -27,7 +27,15 @@ def _period(
             provider=provider,
             concept=field,
             period_end=period_end,
-            unit="shares" if field == "diluted_shares" else currency,
+            unit=(
+                "shares"
+                if field == "diluted_shares"
+                else (
+                    f"{currency}/unit"
+                    if field in {"distribution_per_unit", "nav_per_unit"}
+                    else currency
+                )
+            ),
         )
         for field, value in facts.items()
         if value is not None
@@ -81,6 +89,31 @@ def _settings(
         valuation_cache_ttl_seconds=fresh_ttl,
         valuation_stale_ttl_seconds=stale_ttl,
     )
+
+
+def test_reit_metrics_accept_only_the_approved_finite_keys():
+    approved = {
+        "aggregate_leverage": 0.38,
+        "interest_coverage": 4.2,
+        "occupancy": 0.97,
+        "wale_years": 3.8,
+        "recurring_property_capex": 12.0,
+        "material_currency_exposure": 0.15,
+    }
+
+    fundamentals = _fundamentals(reit_metrics=approved)
+
+    assert fundamentals.reit_metrics == approved
+
+
+def test_reit_metrics_reject_unapproved_keys():
+    with pytest.raises(ValueError, match="unsupported REIT metric keys"):
+        _fundamentals(reit_metrics={"ffo": 100.0})
+
+
+def test_reit_metrics_reject_non_finite_values():
+    with pytest.raises(ValueError, match="REIT metrics must be finite"):
+        _fundamentals(reit_metrics={"occupancy": float("nan")})
 
 
 @pytest.fixture(autouse=True)
@@ -319,6 +352,291 @@ def test_sec_facade_never_infers_bank_metrics_from_balance_sheet_rows(
     assert merged.bank_metrics == {}
     assert "cet1_ratio" not in merged.sources
     assert "npl_ratio" not in merged.sources
+
+
+def test_sec_facade_prefers_direct_reit_facts_and_merges_metrics_without_overwrite(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        reit_metrics={"aggregate_leverage": 0.40},
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[
+            _period(
+                period_end,
+                common_dividends=120.0,
+                common_equity=1_600.0,
+                diluted_shares=1_000.0,
+            )
+        ],
+        sources={
+            "financial_statements": "sec_companyfacts",
+            "aggregate_leverage": "sec_companyfacts",
+        },
+    )
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        reit_metrics={
+            "aggregate_leverage": 0.99,
+            "occupancy": 0.97,
+        },
+        periods=[
+            _period(
+                period_end,
+                provider="yfinance",
+                distribution_per_unit=0.13,
+                nav_per_unit=1.65,
+                real_estate_depreciation=85.0,
+                gain_on_property_sales=12.0,
+            )
+        ],
+        sources={
+            "financial_statements": "yfinance",
+            "aggregate_leverage": "yfinance_info.aggregateLeverage",
+            "occupancy": "yfinance_info.occupancy",
+        },
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "NYSE", "REIT"
+    ).fundamentals
+
+    period = merged.periods[0]
+    assert period.distribution_per_unit == 0.13
+    assert period.nav_per_unit == 1.65
+    assert period.sources["distribution_per_unit"].provider == "yfinance"
+    assert period.sources["nav_per_unit"].provider == "yfinance"
+    assert period.real_estate_depreciation == 85.0
+    assert period.gain_on_property_sales == 12.0
+    assert merged.reit_metrics == {
+        "aggregate_leverage": 0.40,
+        "occupancy": 0.97,
+    }
+    assert merged.sources["aggregate_leverage"] == "sec_companyfacts"
+    assert merged.sources["occupancy"] == "yfinance_info.occupancy"
+    assert "distribution_per_unit" not in merged.missing_fields
+    assert "nav_per_unit" not in merged.missing_fields
+
+
+def test_sec_facade_derives_reit_dpu_and_nav_only_from_compatible_raw_facts(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[
+            _period(
+                period_end,
+                common_dividends=120.0,
+                common_equity=1_600.0,
+                diluted_shares=1_000.0,
+            )
+        ],
+    )
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        periods=[_period(period_end, provider="yfinance", revenue=500.0)],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "NYSE", "REIT"
+    ).fundamentals
+
+    period = merged.periods[0]
+    assert period.distribution_per_unit == pytest.approx(0.12)
+    assert period.nav_per_unit == pytest.approx(1.60)
+    assert (
+        period.sources["distribution_per_unit"].concept
+        == "derived_distribution_per_unit"
+    )
+    assert period.sources["distribution_per_unit"].unit == "USD/unit"
+    assert period.sources["nav_per_unit"].concept == "derived_nav_per_unit"
+    assert period.sources["nav_per_unit"].unit == "USD/unit"
+    assert merged.sources["distribution_per_unit"] == (
+        "derived_distribution_per_unit"
+    )
+    assert merged.sources["nav_per_unit"] == "derived_nav_per_unit"
+    assert "distribution_per_unit" not in merged.missing_fields
+    assert "nav_per_unit" not in merged.missing_fields
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "invalid_unit"),
+    [
+        ("common_dividends", "shares"),
+        ("common_equity", "shares"),
+        ("diluted_shares", "USD"),
+    ],
+)
+def test_sec_facade_does_not_derive_reit_values_from_incompatible_units(
+    monkeypatch,
+    invalid_field,
+    invalid_unit,
+):
+    period_end = date(2025, 12, 31)
+    period = _period(
+        period_end,
+        common_dividends=120.0,
+        common_equity=1_600.0,
+        diluted_shares=1_000.0,
+    )
+    invalid_source = period.sources[invalid_field].model_copy(
+        update={"unit": invalid_unit}
+    )
+    period = period.model_copy(
+        update={
+            "sources": period.sources
+            | {invalid_field: invalid_source}
+        }
+    )
+    sec = _fundamentals(
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[period],
+    )
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        periods=[_period(period_end, provider="yfinance", revenue=500.0)],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    result = valuation_fundamentals.get_fundamentals(
+        "NYSE", "REIT"
+    ).fundamentals.periods[0]
+
+    if invalid_field in {"common_dividends", "diluted_shares"}:
+        assert result.distribution_per_unit is None
+    if invalid_field in {"common_equity", "diluted_shares"}:
+        assert result.nav_per_unit is None
+
+
+def test_sec_facade_ignores_incompatible_reit_fallback_units(monkeypatch):
+    period_end = date(2025, 12, 31)
+    sec = _fundamentals(
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[_period(period_end, revenue=500.0)],
+    )
+    invalid = _period(
+        period_end,
+        provider="yfinance",
+        distribution_per_unit=0.13,
+        nav_per_unit=1.65,
+    )
+    invalid_sources = {
+        field: source.model_copy(update={"unit": "USD"})
+        for field, source in invalid.sources.items()
+    }
+    yahoo = _fundamentals(
+        primary_source="yfinance_fallback",
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        periods=[invalid.model_copy(update={"sources": invalid_sources})],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: sec,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    envelope = valuation_fundamentals.get_fundamentals("NYSE", "REIT")
+
+    period = envelope.fundamentals.periods[0]
+    assert period.distribution_per_unit is None
+    assert period.nav_per_unit is None
+    assert any("unit or period" in warning for warning in envelope.warnings)
+
+
+def test_facade_never_infers_reit_metrics_from_balance_sheet_rows(monkeypatch):
+    period_end = date(2025, 12, 31)
+    yahoo = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:M44U",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        periods=[
+            _period(
+                period_end,
+                currency="SGD",
+                provider="yfinance",
+                total_assets=2_000.0,
+                total_debt=700.0,
+            )
+        ],
+        sources={
+            "financial_statements": "yfinance",
+            "aggregate_leverage": "unrelated_provider_metadata",
+        },
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "SGX", "M44U"
+    ).fundamentals
+
+    assert merged.reit_metrics == {}
+    assert "aggregate_leverage" not in merged.sources
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,16 @@ APPROVED_BANK_METRIC_KEYS = frozenset(
         "regulatory_capital_headroom",
     }
 )
+APPROVED_REIT_METRIC_KEYS = frozenset(
+    {
+        "aggregate_leverage",
+        "interest_coverage",
+        "occupancy",
+        "wale_years",
+        "recurring_property_capex",
+        "material_currency_exposure",
+    }
+)
 
 
 class FactProvenance(BaseModel):
@@ -48,6 +58,8 @@ class FinancialPeriod(BaseModel):
     common_dividends: float | None = None
     distribution_per_unit: float | None = None
     nav_per_unit: float | None = None
+    real_estate_depreciation: float | None = None
+    gain_on_property_sales: float | None = None
     sources: dict[str, FactProvenance] = Field(default_factory=dict)
 
 
@@ -62,6 +74,7 @@ class ValuationFundamentals(BaseModel):
     issuer_classification: str | None = None
     current_diluted_shares: float | None = None
     bank_metrics: dict[str, float] = Field(default_factory=dict)
+    reit_metrics: dict[str, float] = Field(default_factory=dict)
     periods: list[FinancialPeriod] = Field(default_factory=list)
     fetched_at: datetime
     sources: dict[str, str] = Field(default_factory=dict)
@@ -78,6 +91,18 @@ class ValuationFundamentals(BaseModel):
             )
         if any(not math.isfinite(value) for value in metrics.values()):
             raise ValueError("bank metrics must be finite")
+        return metrics
+
+    @field_validator("reit_metrics")
+    @classmethod
+    def validate_reit_metrics(cls, metrics: dict[str, float]) -> dict[str, float]:
+        unsupported = sorted(set(metrics) - APPROVED_REIT_METRIC_KEYS)
+        if unsupported:
+            raise ValueError(
+                f"unsupported REIT metric keys: {', '.join(unsupported)}"
+            )
+        if any(not math.isfinite(value) for value in metrics.values()):
+            raise ValueError("REIT metrics must be finite")
         return metrics
 
 

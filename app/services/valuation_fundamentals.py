@@ -15,6 +15,8 @@ from app.services.sec_companyfacts import (
 )
 from app.services.valuation_types import (
     APPROVED_BANK_METRIC_KEYS,
+    APPROVED_REIT_METRIC_KEYS,
+    FactProvenance,
     FinancialPeriod,
     ValuationFundamentals,
 )
@@ -64,6 +66,8 @@ _PERIOD_FACT_FIELDS = (
     "common_dividends",
     "distribution_per_unit",
     "nav_per_unit",
+    "real_estate_depreciation",
+    "gain_on_property_sales",
 )
 _METADATA_FIELDS = (
     "provider_security_type",
@@ -218,23 +222,23 @@ def _fetch_uncached(
                 "fallback fundamentals and capping confidence below high."
             )
             fallback = fetch_yfinance_fundamentals(exchange, symbol)
-            return _normalize_bank_metrics(fallback), (warning,)
+            return _finalize_fundamentals(fallback), (warning,)
 
-        primary = _normalize_bank_metrics(
+        primary = _normalize_provider_metrics(
             fetch_sec_fundamentals(exchange, symbol)
         )
         if not _needs_yfinance_fallback(primary):
-            return primary, ()
+            return _derive_reit_period_values(primary), ()
         try:
-            fallback = _normalize_bank_metrics(
+            fallback = _normalize_provider_metrics(
                 fetch_yfinance_fundamentals(exchange, symbol)
             )
         except YFinanceStatementsError as exc:
             warning = f"Optional yFinance fundamentals fallback failed: {exc}"
-            return primary, (warning,)
+            return _derive_reit_period_values(primary), (warning,)
         return _merge_sec_with_yfinance(primary, fallback)
 
-    fundamentals = _normalize_bank_metrics(
+    fundamentals = _finalize_fundamentals(
         fetch_yfinance_fundamentals(exchange, symbol)
     )
     if exchange == "SGX":
@@ -256,8 +260,8 @@ def _merge_sec_with_yfinance(
     primary: ValuationFundamentals,
     fallback: ValuationFundamentals,
 ) -> tuple[ValuationFundamentals, tuple[str, ...]]:
-    primary = _normalize_bank_metrics(primary)
-    fallback = _normalize_bank_metrics(fallback)
+    primary = _normalize_provider_metrics(primary)
+    fallback = _normalize_provider_metrics(fallback)
     warnings = [*primary.warnings, *fallback.warnings]
     if (
         primary.symbol != fallback.symbol
@@ -361,6 +365,17 @@ def _merge_sec_with_yfinance(
         filled_fields.add(metric)
     top_level_updates["bank_metrics"] = bank_metrics
 
+    reit_metrics = dict(primary.reit_metrics)
+    for metric, value in fallback.reit_metrics.items():
+        if metric in reit_metrics:
+            continue
+        reit_metrics[metric] = value
+        sources[metric] = fallback.sources.get(
+            metric, fallback.primary_source
+        )
+        filled_fields.add(metric)
+    top_level_updates["reit_metrics"] = reit_metrics
+
     for period in merged_periods:
         for field, provenance in period.sources.items():
             sources[field] = provenance.provider
@@ -375,9 +390,14 @@ def _merge_sec_with_yfinance(
     top_level_updates["sources"] = sources
 
     candidate = primary.model_copy(update=top_level_updates)
-    top_level_updates["missing_fields"] = _remaining_missing_fields(candidate)
-    top_level_updates["warnings"] = list(_unique(warnings))
-    return primary.model_copy(update=top_level_updates), _unique(warnings)
+    candidate = _derive_reit_period_values(candidate)
+    candidate = candidate.model_copy(
+        update={
+            "missing_fields": _remaining_missing_fields(candidate),
+            "warnings": list(_unique(warnings)),
+        }
+    )
+    return candidate, _unique(warnings)
 
 
 def _normalize_bank_metrics(
@@ -405,6 +425,156 @@ def _normalize_bank_metrics(
     )
 
 
+def _normalize_reit_metrics(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    reit_metrics = {
+        key: float(value)
+        for key, value in fundamentals.reit_metrics.items()
+        if key in APPROVED_REIT_METRIC_KEYS
+        and isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    }
+    sources = dict(fundamentals.sources)
+    for metric in APPROVED_REIT_METRIC_KEYS:
+        if metric not in reit_metrics:
+            sources.pop(metric, None)
+            continue
+        source = sources.get(metric)
+        if not isinstance(source, str) or not source.strip():
+            sources[metric] = fundamentals.primary_source
+    return fundamentals.model_copy(
+        deep=True,
+        update={"reit_metrics": reit_metrics, "sources": sources},
+    )
+
+
+def _normalize_provider_metrics(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    return _normalize_reit_metrics(_normalize_bank_metrics(fundamentals))
+
+
+def _finalize_fundamentals(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    normalized = _normalize_provider_metrics(fundamentals)
+    derived = _derive_reit_period_values(normalized)
+    return derived.model_copy(
+        update={"missing_fields": _remaining_missing_fields(derived)}
+    )
+
+
+def _derive_reit_period_values(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    if not _is_reit(fundamentals):
+        return fundamentals
+    currency = fundamentals.currency.strip().upper()
+    periods: list[FinancialPeriod] = []
+    top_sources = dict(fundamentals.sources)
+    for period in fundamentals.periods:
+        if period.currency.strip().upper() != currency:
+            periods.append(period)
+            continue
+        updates: dict[str, object] = {}
+        period_sources = dict(period.sources)
+        units = _positive_real(period.diluted_shares)
+        units_compatible = _period_fact_is_compatible(
+            period, "diluted_shares", currency
+        )
+        if (
+            period.distribution_per_unit is None
+            and units is not None
+            and units_compatible
+        ):
+            distributions = _positive_real(period.common_dividends)
+            if distributions is not None and _period_fact_is_compatible(
+                period, "common_dividends", currency
+            ):
+                updates["distribution_per_unit"] = distributions / units
+                period_sources["distribution_per_unit"] = FactProvenance(
+                    provider="valuation_fundamentals",
+                    concept="derived_distribution_per_unit",
+                    form="derived",
+                    period_end=period.period_end,
+                    unit=f"{period.currency}/unit",
+                )
+                top_sources["distribution_per_unit"] = (
+                    "derived_distribution_per_unit"
+                )
+        if (
+            period.nav_per_unit is None
+            and units is not None
+            and units_compatible
+        ):
+            equity = _positive_real(period.common_equity)
+            if equity is not None and _period_fact_is_compatible(
+                period, "common_equity", currency
+            ):
+                updates["nav_per_unit"] = equity / units
+                period_sources["nav_per_unit"] = FactProvenance(
+                    provider="valuation_fundamentals",
+                    concept="derived_nav_per_unit",
+                    form="derived",
+                    period_end=period.period_end,
+                    unit=f"{period.currency}/unit",
+                )
+                top_sources["nav_per_unit"] = "derived_nav_per_unit"
+        if updates:
+            updates["sources"] = period_sources
+            periods.append(period.model_copy(update=updates))
+        else:
+            periods.append(period)
+    return fundamentals.model_copy(
+        update={"periods": periods, "sources": top_sources}
+    )
+
+
+def _is_reit(fundamentals: ValuationFundamentals) -> bool:
+    evidence = " ".join(
+        value.casefold()
+        for value in (
+            fundamentals.provider_security_type,
+            fundamentals.industry,
+            fundamentals.issuer_classification,
+        )
+        if value is not None
+    )
+    compact = evidence.replace("_", "").replace("-", "").replace(" ", "")
+    return any(
+        term in evidence or term.replace(" ", "") in compact
+        for term in (
+            "reit",
+            "real estate investment trust",
+            "property trust",
+        )
+    )
+
+
+def _positive_real(value: object) -> float | None:
+    if not isinstance(value, Real) or isinstance(value, bool):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _period_fact_is_compatible(
+    period: FinancialPeriod,
+    field: str,
+    currency: str,
+) -> bool:
+    provenance = period.sources.get(field)
+    return _compatible_provenance(
+        field,
+        provenance_unit=provenance.unit if provenance else None,
+        provenance_period_end=provenance.period_end if provenance else None,
+        expected_currency=currency,
+        expected_period_end=period.period_end,
+    )
+
+
 def _compatible_provenance(
     field: str,
     *,
@@ -415,8 +585,17 @@ def _compatible_provenance(
 ) -> bool:
     if provenance_unit is None or provenance_period_end != expected_period_end:
         return False
-    expected_unit = "SHARES" if field == "diluted_shares" else expected_currency
-    return provenance_unit.strip().upper() == expected_unit
+    normalized_unit = provenance_unit.strip().upper()
+    if field == "diluted_shares":
+        return normalized_unit in {"SHARES", "UNITS"}
+    if field in {"distribution_per_unit", "nav_per_unit"}:
+        return normalized_unit in {
+            f"{expected_currency}/SHARE",
+            f"{expected_currency}/SHARES",
+            f"{expected_currency}/UNIT",
+            f"{expected_currency}/UNITS",
+        }
+    return normalized_unit == expected_currency
 
 
 def _remaining_missing_fields(

@@ -71,6 +71,9 @@ _CONCEPTS: dict[str, tuple[str, ...]] = {
     "common_equity": (
         "CommonStockholdersEquity",
         "StockholdersEquity",
+        "PartnersCapital",
+        "LimitedPartnersCapital",
+        "MembersEquity",
     ),
     "cash_and_equivalents": (
         "CashAndCashEquivalentsAtCarryingValue",
@@ -85,10 +88,30 @@ _CONCEPTS: dict[str, tuple[str, ...]] = {
     "diluted_shares": (
         "WeightedAverageNumberOfDilutedSharesOutstanding",
         "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+        "WeightedAverageNumberOfUnitsOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
     ),
     "common_dividends": (
         "PaymentsOfDividendsCommonStock",
+        "PaymentsOfDistributionsToCommonStockholders",
         "PaymentsOfDividends",
+    ),
+    "distribution_per_unit": (
+        "CommonStockDividendsPerShareDeclared",
+        "CommonStockDividendsPerShareCashPaid",
+        "DistributionsPerUnit",
+    ),
+    "nav_per_unit": (
+        "NetAssetValuePerShare",
+        "NetAssetValuePerUnit",
+    ),
+    "real_estate_depreciation": (
+        "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment",
+        "DepreciationDepletionAndAmortization",
+    ),
+    "gain_on_property_sales": (
+        "GainLossOnSaleOfRealEstate",
+        "GainLossOnSaleOfPropertyPlantEquipment",
     ),
 }
 _INSTANT_FIELDS = frozenset(
@@ -97,6 +120,7 @@ _INSTANT_FIELDS = frozenset(
         "cash_and_equivalents",
         "total_assets",
         "total_debt",
+        "nav_per_unit",
     }
 )
 _ADDITIVE_FIELDS = frozenset(
@@ -107,9 +131,16 @@ _ADDITIVE_FIELDS = frozenset(
         "revenue",
         "net_income_common",
         "common_dividends",
+        "distribution_per_unit",
+        "real_estate_depreciation",
+        "gain_on_property_sales",
     }
 )
 _FACT_FIELDS = tuple(_CONCEPTS)
+_REIT_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
+_OPTIONAL_FACT_FIELDS = frozenset(
+    {"real_estate_depreciation", "gain_on_property_sales"}
+)
 
 
 @dataclass(frozen=True)
@@ -163,15 +194,18 @@ def fetch_sec_fundamentals(
         key=lambda period: (period.period_end, period.is_ttm),
     )
     current_shares = _latest_diluted_shares(periods)
+    metadata = _submission_metadata(submissions_payload)
+    is_reit = _metadata_is_reit(metadata)
     missing_fields = [
         field
         for field in _FACT_FIELDS
+        if field not in _OPTIONAL_FACT_FIELDS
+        if is_reit or field not in _REIT_FACT_FIELDS
         if not any(getattr(period, field) is not None for period in periods)
     ]
     if current_shares is None:
         missing_fields.append("current_diluted_shares")
 
-    metadata = _submission_metadata(submissions_payload)
     sources = {
         "financial_statements": "sec_companyfacts",
         "submissions_metadata": "sec_submissions",
@@ -250,7 +284,7 @@ def _build_annual_periods(
                 for fact in _concept_facts(
                     concepts,
                     concept,
-                    _unit_for_field(field, currency),
+                    _units_for_field(field, currency),
                 )
                 if _is_annual_fact(fact, field)
             ]
@@ -312,7 +346,7 @@ def _build_ttm_period(
                 for fact in _concept_facts(
                     concepts,
                     concept,
-                    _unit_for_field(field, currency),
+                    _units_for_field(field, currency),
                 )
                 if _is_quarter_fact(fact, field)
             ]
@@ -535,36 +569,37 @@ def _latest_fact(candidates: list[_SecFact]) -> _SecFact:
 
 
 def _concept_facts(
-    concepts: Mapping[str, Any], concept: str, unit: str
+    concepts: Mapping[str, Any], concept: str, accepted_units: tuple[str, ...]
 ) -> list[_SecFact]:
     units = _concept_units(concepts, concept)
-    raw_facts = units.get(unit)
-    if not isinstance(raw_facts, list):
-        return []
     parsed: list[_SecFact] = []
-    for raw_fact in raw_facts:
-        if not isinstance(raw_fact, Mapping):
+    for unit in accepted_units:
+        raw_facts = units.get(unit)
+        if not isinstance(raw_facts, list):
             continue
-        form = _text(raw_fact.get("form"))
-        end = _date(raw_fact.get("end"))
-        value = _finite_float(raw_fact.get("val"))
-        if form not in _ALLOWED_FORMS or end is None or value is None:
-            continue
-        parsed.append(
-            _SecFact(
-                concept=concept,
-                unit=unit,
-                value=value,
-                start=_date(raw_fact.get("start")),
-                end=end,
-                filed=_date(raw_fact.get("filed")),
-                accession=_text(raw_fact.get("accn")),
-                form=form,
-                fiscal_year=_integer(raw_fact.get("fy")),
-                fiscal_period=_text(raw_fact.get("fp")),
-                frame=_text(raw_fact.get("frame")),
+        for raw_fact in raw_facts:
+            if not isinstance(raw_fact, Mapping):
+                continue
+            form = _text(raw_fact.get("form"))
+            end = _date(raw_fact.get("end"))
+            value = _finite_float(raw_fact.get("val"))
+            if form not in _ALLOWED_FORMS or end is None or value is None:
+                continue
+            parsed.append(
+                _SecFact(
+                    concept=concept,
+                    unit=unit,
+                    value=value,
+                    start=_date(raw_fact.get("start")),
+                    end=end,
+                    filed=_date(raw_fact.get("filed")),
+                    accession=_text(raw_fact.get("accn")),
+                    form=form,
+                    fiscal_year=_integer(raw_fact.get("fy")),
+                    fiscal_period=_text(raw_fact.get("fp")),
+                    frame=_text(raw_fact.get("frame")),
+                )
             )
-        )
     return parsed
 
 
@@ -609,8 +644,16 @@ def _frame_index(frame: str | None) -> int | None:
     return int(match.group("year")) * 4 + int(match.group("quarter")) - 1
 
 
-def _unit_for_field(field: str, currency: str) -> str:
-    return "shares" if field == "diluted_shares" else currency
+def _units_for_field(field: str, currency: str) -> tuple[str, ...]:
+    if field == "diluted_shares":
+        return ("shares", "units")
+    if field in {"distribution_per_unit", "nav_per_unit"}:
+        return (
+            f"{currency}/shares",
+            f"{currency}/unit",
+            f"{currency}/units",
+        )
+    return (currency,)
 
 
 def _provenance(fact: _SecFact) -> FactProvenance:
@@ -652,6 +695,21 @@ def _submission_metadata(payload: Any) -> dict[str, str | None]:
         "industry": description,
         "issuer_classification": classification,
     }
+
+
+def _metadata_is_reit(metadata: Mapping[str, str | None]) -> bool:
+    evidence = " ".join(
+        value.casefold() for value in metadata.values() if value is not None
+    )
+    compact = evidence.replace("_", "").replace("-", "").replace(" ", "")
+    return any(
+        term in evidence or term.replace(" ", "") in compact
+        for term in (
+            "reit",
+            "real estate investment trust",
+            "property trust",
+        )
+    )
 
 
 def _finite_float(value: Any) -> float | None:

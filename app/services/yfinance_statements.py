@@ -48,6 +48,10 @@ _FIELD_ALIASES: dict[str, tuple[StatementKind, tuple[str, ...]]] = {
     "common_equity": (
         "balance",
         (
+            "Unitholder Equity",
+            "Unitholders Equity",
+            "Unitholders' Funds",
+            "Net Assets Attributable To Unitholders",
             "Stockholders Equity",
             "Common Stock Equity",
             "Total Stockholder Equity",
@@ -68,6 +72,8 @@ _FIELD_ALIASES: dict[str, tuple[StatementKind, tuple[str, ...]]] = {
     "diluted_shares": (
         "income",
         (
+            "Weighted Average Number Of Units Outstanding",
+            "Basic Average Shares",
             "Diluted Average Shares",
             "Weighted Average Number Of Diluted Shares Outstanding",
         ),
@@ -75,6 +81,14 @@ _FIELD_ALIASES: dict[str, tuple[StatementKind, tuple[str, ...]]] = {
     "common_dividends": (
         "cashflow",
         ("Cash Dividends Paid", "Common Stock Dividend Paid"),
+    ),
+    "distribution_per_unit": (
+        "cashflow",
+        ("Distribution Per Unit", "Distributions Per Unit", "DPU"),
+    ),
+    "nav_per_unit": (
+        "balance",
+        ("NAV Per Unit", "Net Asset Value Per Unit"),
     ),
 }
 
@@ -85,6 +99,7 @@ _ADDITIVE_FIELDS = {
     if kind == "cashflow" or field in {"revenue", "net_income_common"}
 }
 _FACT_FIELDS = (*_FIELD_ALIASES, "interest_paid_outside_operating")
+_REIT_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
 _CLASSIFICATION_KEYS = (
     "interestPaidClassification",
     "interest_paid_classification",
@@ -110,6 +125,8 @@ def fetch_yfinance_fundamentals(
             raise ValueError("Yahoo did not provide a financial or quote currency")
         frames = _read_statement_frames(ticker, warnings)
         shares = _read_shares(ticker, warnings)
+        is_reit = _is_reit(info)
+        dividends = _read_dividends(ticker, warnings) if is_reit else None
     except YFinanceStatementsError as exc:
         raise YFinanceStatementsError(
             f"Unable to fetch yFinance statements for {yahoo_symbol}: {exc}"
@@ -134,10 +151,20 @@ def fetch_yfinance_fundamentals(
         [*annual_periods, *([trailing_period] if trailing_period else [])],
         key=lambda period: (period.period_end, period.is_ttm),
     )
+    if is_reit:
+        periods = _normalize_reit_periods(
+            periods,
+            dividends,
+            shares,
+            currency,
+            info,
+            warnings,
+        )
     current_shares = _current_shares(shares, info, fast_info)
     missing_fields = [
         field
         for field in _FACT_FIELDS
+        if is_reit or field not in _REIT_FACT_FIELDS
         if not any(getattr(period, field) is not None for period in periods)
     ]
     if current_shares is None:
@@ -146,6 +173,11 @@ def fetch_yfinance_fundamentals(
     sources = {"financial_statements": "yfinance"}
     if current_shares is not None:
         sources["current_diluted_shares"] = "yfinance"
+    reit_metrics = (
+        _normalize_reit_metrics(periods, info, currency, warnings, sources)
+        if is_reit
+        else {}
+    )
 
     return ValuationFundamentals(
         symbol=public_symbol,
@@ -157,6 +189,7 @@ def fetch_yfinance_fundamentals(
         industry=_text(info.get("industry")),
         issuer_classification=_text(info.get("category")),
         current_diluted_shares=current_shares,
+        reit_metrics=reit_metrics,
         periods=periods,
         fetched_at=datetime.now(timezone.utc),
         sources=sources,
@@ -214,6 +247,14 @@ def _read_shares(ticker: Any, warnings: list[str]) -> Any:
         return ticker.get_shares_full()
     except Exception as exc:  # noqa: BLE001 - statement shares remain available.
         warnings.append(f"yFinance share history unavailable: {exc}")
+        return None
+
+
+def _read_dividends(ticker: Any, warnings: list[str]) -> Any:
+    try:
+        return ticker.dividends
+    except Exception as exc:  # noqa: BLE001 - dividend history is best effort.
+        warnings.append(f"yFinance dividend history unavailable: {exc}")
         return None
 
 
@@ -338,6 +379,368 @@ def _metadata_value(
         if timestamp is not None and timestamp.date() == period_end:
             return period_value
     return None
+
+
+def _is_reit(info: Mapping[str, Any]) -> bool:
+    evidence = " ".join(
+        value.casefold()
+        for value in (
+            _text(info.get("quoteType")),
+            _text(info.get("industry")),
+        )
+        if value is not None
+    )
+    compact = evidence.replace("_", "").replace("-", "").replace(" ", "")
+    return any(
+        term in evidence or term.replace(" ", "") in compact
+        for term in (
+            "reit",
+            "real estate investment trust",
+            "property trust",
+        )
+    )
+
+
+def _normalize_reit_periods(
+    periods: list[FinancialPeriod],
+    dividends: Any,
+    shares: Any,
+    currency: str,
+    info: Mapping[str, Any],
+    warnings: list[str],
+) -> list[FinancialPeriod]:
+    normalized = [
+        _add_reit_units(period, shares)
+        if period.currency.strip().upper() == currency
+        else period
+        for period in periods
+    ]
+    observations = _dividend_observations(dividends)
+    if observations:
+        fiscal_year_end = _fiscal_year_end(info)
+        if fiscal_year_end is None:
+            warnings.append(
+                "REIT dividend history was grouped by calendar year because "
+                "fiscal year-end metadata was unavailable."
+            )
+        annual_totals: dict[date, float] = {}
+        for dividend_date, amount in observations:
+            period_end = _distribution_period_end(
+                dividend_date, fiscal_year_end
+            )
+            annual_totals[period_end] = (
+                annual_totals.get(period_end, 0.0) + amount
+            )
+        for period_end, amount in annual_totals.items():
+            normalized = _add_distribution_period(
+                normalized,
+                period_end=period_end,
+                amount=amount,
+                currency=currency,
+                is_ttm=False,
+                form="dividend_history_annual",
+            )
+
+        latest_dividend_date = observations[-1][0]
+        window_start = (
+            pd.Timestamp(latest_dividend_date) - pd.DateOffset(years=1)
+        ).date()
+        trailing_amount = sum(
+            amount
+            for dividend_date, amount in observations
+            if window_start < dividend_date <= latest_dividend_date
+        )
+        if not any(
+            period.is_ttm and period.distribution_per_unit is not None
+            for period in normalized
+        ):
+            normalized = _add_distribution_period(
+                normalized,
+                period_end=latest_dividend_date,
+                amount=trailing_amount,
+                currency=currency,
+                is_ttm=True,
+                form="dividend_history_ttm",
+            )
+
+    normalized = [_derive_nav_per_unit(period) for period in normalized]
+    return sorted(
+        normalized,
+        key=lambda period: (period.period_end, period.is_ttm),
+    )
+
+
+def _add_reit_units(period: FinancialPeriod, shares: Any) -> FinancialPeriod:
+    if _positive_float(period.diluted_shares) is not None:
+        return period
+    units = _units_at_or_before(shares, period.period_end)
+    if units is None:
+        return period
+    sources = dict(period.sources)
+    sources["diluted_shares"] = _provenance(
+        "get_shares_full",
+        period.period_end,
+        "units",
+        "share_history",
+    )
+    return period.model_copy(
+        update={"diluted_shares": units, "sources": sources}
+    )
+
+
+def _units_at_or_before(shares: Any, period_end: date) -> float | None:
+    if not isinstance(shares, pd.Series) or shares.empty:
+        return None
+    candidates: list[tuple[pd.Timestamp, int, float]] = []
+    for position, (raw_date, raw_value) in enumerate(shares.items()):
+        timestamp = _timestamp(raw_date)
+        units = _positive_float(raw_value)
+        if timestamp is None or timestamp.date() > period_end or units is None:
+            continue
+        candidates.append((timestamp, position, units))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _dividend_observations(dividends: Any) -> list[tuple[date, float]]:
+    if not isinstance(dividends, pd.Series) or dividends.empty:
+        return []
+    observations: list[tuple[date, float]] = []
+    for raw_date, raw_value in dividends.items():
+        timestamp = _timestamp(raw_date)
+        amount = _positive_float(raw_value)
+        if timestamp is None or amount is None:
+            continue
+        observations.append((timestamp.date(), amount))
+    return sorted(observations, key=lambda item: item[0])
+
+
+def _fiscal_year_end(info: Mapping[str, Any]) -> tuple[int, int] | None:
+    for key in ("fiscalYearEnd", "lastFiscalYearEnd", "nextFiscalYearEnd"):
+        raw_value = info.get(key)
+        if isinstance(raw_value, str):
+            parts = raw_value.strip().replace("/", "-").split("-")
+            if len(parts) == 2 and all(part.isdigit() for part in parts):
+                month, day = (int(part) for part in parts)
+                if _valid_month_day(month, day):
+                    return month, day
+        timestamp: pd.Timestamp | None = None
+        if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            try:
+                timestamp = pd.Timestamp(raw_value, unit="s")
+            except (TypeError, ValueError, OverflowError):
+                timestamp = None
+        elif raw_value is not None:
+            timestamp = _timestamp(raw_value)
+        if timestamp is not None:
+            return timestamp.month, timestamp.day
+    return None
+
+
+def _valid_month_day(month: int, day: int) -> bool:
+    try:
+        date(2000, month, day)
+    except ValueError:
+        return False
+    return True
+
+
+def _distribution_period_end(
+    dividend_date: date, fiscal_year_end: tuple[int, int] | None
+) -> date:
+    if fiscal_year_end is None:
+        return date(dividend_date.year, 12, 31)
+    month, day = fiscal_year_end
+    year = (
+        dividend_date.year
+        if (dividend_date.month, dividend_date.day) <= fiscal_year_end
+        else dividend_date.year + 1
+    )
+    while day > 0:
+        try:
+            return date(year, month, day)
+        except ValueError:
+            day -= 1
+    raise AssertionError("validated fiscal year-end could not be constructed")
+
+
+def _add_distribution_period(
+    periods: list[FinancialPeriod],
+    *,
+    period_end: date,
+    amount: float,
+    currency: str,
+    is_ttm: bool,
+    form: str,
+) -> list[FinancialPeriod]:
+    source = _provenance(
+        "Ticker.dividends",
+        period_end,
+        f"{currency}/unit",
+        form,
+    )
+    updated: list[FinancialPeriod] = []
+    matched = False
+    for period in periods:
+        if period.period_end != period_end or period.is_ttm != is_ttm:
+            updated.append(period)
+            continue
+        matched = True
+        if period.distribution_per_unit is not None:
+            updated.append(period)
+            continue
+        sources = dict(period.sources)
+        sources["distribution_per_unit"] = source
+        updated.append(
+            period.model_copy(
+                update={
+                    "distribution_per_unit": amount,
+                    "sources": sources,
+                }
+            )
+        )
+    if not matched:
+        updated.append(
+            FinancialPeriod(
+                period_end=period_end,
+                fiscal_year=None if is_ttm else period_end.year,
+                is_ttm=is_ttm,
+                currency=currency,
+                distribution_per_unit=amount,
+                sources={"distribution_per_unit": source},
+            )
+        )
+    return updated
+
+
+def _derive_nav_per_unit(period: FinancialPeriod) -> FinancialPeriod:
+    if period.nav_per_unit is not None:
+        return period
+    equity = _positive_float(period.common_equity)
+    units = _positive_float(period.diluted_shares)
+    equity_source = period.sources.get("common_equity")
+    unit_source = period.sources.get("diluted_shares")
+    if (
+        equity is None
+        or units is None
+        or not _compatible_period_source(
+            equity_source, period, {period.currency.strip().upper()}
+        )
+        or not _compatible_period_source(
+            unit_source, period, {"SHARES", "UNITS"}
+        )
+    ):
+        return period
+    sources = dict(period.sources)
+    sources["nav_per_unit"] = _provenance(
+        "derived_nav_per_unit",
+        period.period_end,
+        f"{period.currency}/unit",
+        "derived",
+    )
+    return period.model_copy(
+        update={"nav_per_unit": equity / units, "sources": sources}
+    )
+
+
+def _compatible_period_source(
+    source: FactProvenance | None,
+    period: FinancialPeriod,
+    accepted_units: set[str],
+) -> bool:
+    return bool(
+        source is not None
+        and source.period_end == period.period_end
+        and source.unit is not None
+        and source.unit.strip().upper() in accepted_units
+    )
+
+
+def _normalize_reit_metrics(
+    periods: list[FinancialPeriod],
+    info: Mapping[str, Any],
+    currency: str,
+    warnings: list[str],
+    sources: dict[str, str],
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    aliases: dict[str, tuple[tuple[str, ...], bool]] = {
+        "aggregate_leverage": (
+            ("aggregateLeverage", "aggregate_leverage"),
+            True,
+        ),
+        "interest_coverage": (
+            ("interestCoverage", "interest_coverage"),
+            False,
+        ),
+        "occupancy": (("occupancy", "occupancyRate"), True),
+        "wale_years": (
+            ("waleYears", "weightedAverageLeaseExpiry", "wale"),
+            False,
+        ),
+        "recurring_property_capex": (
+            ("recurringPropertyCapex", "recurring_property_capex"),
+            False,
+        ),
+        "material_currency_exposure": (
+            ("materialCurrencyExposure", "material_currency_exposure"),
+            True,
+        ),
+    }
+    for metric, (provider_keys, is_ratio) in aliases.items():
+        for key in provider_keys:
+            value = _nonnegative_float(info.get(key))
+            if value is None:
+                continue
+            if is_ratio:
+                value = _normalized_ratio(value)
+                if value is None:
+                    continue
+            metrics[metric] = value
+            sources[metric] = f"yfinance_info.{key}"
+            break
+
+    if "aggregate_leverage" not in metrics:
+        for period in sorted(
+            periods,
+            key=lambda candidate: (candidate.period_end, candidate.is_ttm),
+            reverse=True,
+        ):
+            assets = _positive_float(period.total_assets)
+            debt = _nonnegative_float(period.total_debt)
+            if (
+                period.currency.strip().upper() != currency
+                or assets is None
+                or debt is None
+                or not _compatible_period_source(
+                    period.sources.get("total_assets"), period, {currency}
+                )
+                or not _compatible_period_source(
+                    period.sources.get("total_debt"), period, {currency}
+                )
+            ):
+                continue
+            leverage = debt / assets
+            if not math.isfinite(leverage):
+                continue
+            metrics["aggregate_leverage"] = leverage
+            sources["aggregate_leverage"] = "derived_aggregate_leverage"
+            warnings.append(
+                "REIT derived aggregate leverage from same-period total "
+                "debt and total assets; no provider-reported aggregate "
+                "leverage was available."
+            )
+            break
+    return metrics
+
+
+def _normalized_ratio(value: float) -> float | None:
+    if value > 1.0:
+        if value > 100.0:
+            return None
+        value /= 100.0
+    return value
 
 
 def _build_annual_periods(
@@ -620,7 +1023,11 @@ def _provenance(
 
 
 def _unit_for_field(field: str, currency: str) -> str:
-    return "shares" if field == "diluted_shares" else currency
+    if field == "diluted_shares":
+        return "shares"
+    if field in {"distribution_per_unit", "nav_per_unit"}:
+        return f"{currency}/unit"
+    return currency
 
 
 def _current_shares(
@@ -662,6 +1069,11 @@ def _finite_float(value: Any) -> float | None:
 def _positive_float(value: Any) -> float | None:
     number = _finite_float(value)
     return number if number is not None and number > 0 else None
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    number = _finite_float(value)
+    return number if number is not None and number >= 0 else None
 
 
 def _text(value: Any) -> str | None:

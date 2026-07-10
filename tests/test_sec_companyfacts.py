@@ -481,6 +481,84 @@ def test_selects_latest_compatible_amendment_without_summing_duplicates(
         ),
         ("common_dividends", "PaymentsOfDividendsCommonStock", "USD", 31, 31),
         ("common_dividends", "PaymentsOfDividends", "USD", 32, 32),
+        (
+            "common_dividends",
+            "PaymentsOfDistributionsToCommonStockholders",
+            "USD",
+            33,
+            33,
+        ),
+        (
+            "distribution_per_unit",
+            "CommonStockDividendsPerShareDeclared",
+            "USD/shares",
+            0.31,
+            0.31,
+        ),
+        (
+            "distribution_per_unit",
+            "CommonStockDividendsPerShareCashPaid",
+            "USD/shares",
+            0.32,
+            0.32,
+        ),
+        (
+            "distribution_per_unit",
+            "DistributionsPerUnit",
+            "USD/shares",
+            0.33,
+            0.33,
+        ),
+        (
+            "nav_per_unit",
+            "NetAssetValuePerShare",
+            "USD/shares",
+            1.21,
+            1.21,
+        ),
+        (
+            "nav_per_unit",
+            "NetAssetValuePerUnit",
+            "USD/shares",
+            1.22,
+            1.22,
+        ),
+        (
+            "diluted_shares",
+            "WeightedAverageNumberOfUnitsOutstanding",
+            "shares",
+            43,
+            43,
+        ),
+        ("common_equity", "PartnersCapital", "USD", 303, 303),
+        (
+            "real_estate_depreciation",
+            "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment",
+            "USD",
+            41,
+            41,
+        ),
+        (
+            "real_estate_depreciation",
+            "DepreciationDepletionAndAmortization",
+            "USD",
+            42,
+            42,
+        ),
+        (
+            "gain_on_property_sales",
+            "GainLossOnSaleOfRealEstate",
+            "USD",
+            15,
+            15,
+        ),
+        (
+            "gain_on_property_sales",
+            "GainLossOnSaleOfPropertyPlantEquipment",
+            "USD",
+            16,
+            16,
+        ),
     ],
 )
 def test_normalizes_reviewed_sec_concept_alternatives(
@@ -498,6 +576,7 @@ def test_normalizes_reviewed_sec_concept_alternatives(
         "cash_and_equivalents",
         "total_assets",
         "total_debt",
+        "nav_per_unit",
     }
     concept_fact = sec_fact(
         value,
@@ -539,6 +618,37 @@ def test_uses_ordered_concept_priority_before_newer_fallback(
         period.sources["revenue"].concept
         == "RevenueFromContractWithCustomerExcludingAssessedTax"
     )
+
+
+def test_reit_per_unit_alias_uses_the_compatible_annual_unit_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    quarter = sec_fact(
+        0.08,
+        start="2024-10-01",
+        form="10-Q",
+        fiscal_period="Q4",
+        frame="CY2024Q4",
+    )
+    facts = company_facts(
+        {
+            "CommonStockDividendsPerShareDeclared": {
+                "USD/shares": [quarter],
+                "USD/unit": [sec_fact(0.30)],
+            },
+            "Revenues": {"USD": [sec_fact(500.0)]},
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    period = sec_companyfacts.fetch_sec_fundamentals(
+        "NYSE", "AAPL"
+    ).periods[0]
+
+    assert period.distribution_per_unit == 0.30
+    assert period.sources["distribution_per_unit"].unit == "USD/unit"
 
 
 def test_prefers_common_equity_over_broad_stockholders_equity(
@@ -835,3 +945,128 @@ def test_provider_http_failure_is_wrapped_as_typed_error(
 
     assert exc_info.value.status_code == 502
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_reit_facts_keep_units_latest_amendments_and_field_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    original = {
+        "filed": "2025-02-01",
+        "accession": "reit-original",
+    }
+    amended = {
+        "form": "10-K/A",
+        "filed": "2025-03-01",
+        "accession": "reit-amendment",
+    }
+    facts = company_facts(
+        {
+            "CommonStockDividendsPerShareDeclared": {
+                "USD/shares": [
+                    sec_fact(0.10, **original),
+                    sec_fact(0.12, **amended),
+                ],
+                "USD": [sec_fact(999.0, **amended)],
+            },
+            "PaymentsOfDistributionsToCommonStockholders": {
+                "USD": [
+                    sec_fact(100.0, **original),
+                    sec_fact(120.0, **amended),
+                ],
+                "shares": [sec_fact(999.0, **amended)],
+            },
+            "WeightedAverageNumberOfUnitsOutstanding": {
+                "shares": [
+                    sec_fact(1_000.0, **original),
+                    sec_fact(1_100.0, **amended),
+                ],
+                "USD": [sec_fact(999.0, **amended)],
+            },
+            "PartnersCapital": {
+                "USD": [
+                    sec_fact(1_500.0, start=None, **original),
+                    sec_fact(1_600.0, start=None, **amended),
+                ],
+                "shares": [sec_fact(999.0, start=None, **amended)],
+            },
+            "NetAssetValuePerShare": {
+                "USD/shares": [
+                    sec_fact(1.30, start=None, **original),
+                    sec_fact(1.40, start=None, **amended),
+                ],
+                "USD": [sec_fact(999.0, start=None, **amended)],
+            },
+            "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment": {
+                "USD": [
+                    sec_fact(80.0, **original),
+                    sec_fact(85.0, **amended),
+                ]
+            },
+            "GainLossOnSaleOfRealEstate": {
+                "USD": [
+                    sec_fact(10.0, **original),
+                    sec_fact(12.0, **amended),
+                ]
+            },
+            "Revenues": {"USD": [sec_fact(500.0)]},
+        }
+    )
+    reit_submission = submissions() | {
+        "entityType": "REIT",
+        "sicDescription": "Real Estate Investment Trusts",
+    }
+    install_fetch_payloads(
+        monkeypatch,
+        facts,
+        submission_payload=reit_submission,
+    )
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NYSE", "AAPL")
+
+    period = result.periods[0]
+    assert period.distribution_per_unit == 0.12
+    assert period.common_dividends == 120.0
+    assert period.diluted_shares == 1_100.0
+    assert period.common_equity == 1_600.0
+    assert period.nav_per_unit == 1.40
+    assert period.real_estate_depreciation == 85.0
+    assert period.gain_on_property_sales == 12.0
+    assert {
+        field: period.sources[field].unit
+        for field in (
+            "distribution_per_unit",
+            "common_dividends",
+            "diluted_shares",
+            "common_equity",
+            "nav_per_unit",
+            "real_estate_depreciation",
+            "gain_on_property_sales",
+        )
+    } == {
+        "distribution_per_unit": "USD/shares",
+        "common_dividends": "USD",
+        "diluted_shares": "shares",
+        "common_equity": "USD",
+        "nav_per_unit": "USD/shares",
+        "real_estate_depreciation": "USD",
+        "gain_on_property_sales": "USD",
+    }
+    for field in (
+        "distribution_per_unit",
+        "common_dividends",
+        "diluted_shares",
+        "common_equity",
+        "nav_per_unit",
+        "real_estate_depreciation",
+        "gain_on_property_sales",
+    ):
+        source = period.sources[field]
+        assert source.accession == "reit-amendment"
+        assert source.form == "10-K/A"
+        assert source.filed_at.isoformat() == "2025-03-01"
+    assert "ffo" not in result.missing_fields
+    assert "affo" not in result.missing_fields
+    assert "real_estate_depreciation" not in result.missing_fields
+    assert "gain_on_property_sales" not in result.missing_fields
