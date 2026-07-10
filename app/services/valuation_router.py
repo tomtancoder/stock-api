@@ -76,8 +76,18 @@ def classify_company(
             reasons=("The security type has no approved valuation model.",),
         )
 
+    insurance_sources = _matching_sources(metadata, _INSURANCE_TERMS)
     reit_sources = _matching_sources(metadata, _REIT_TERMS)
     if reit_sources:
+        if insurance_sources:
+            return CompanyClassification(
+                company_type="unsupported",
+                supported=False,
+                sources=_unique((*reit_sources, *insurance_sources)),
+                reasons=(
+                    "Insurance companies have no approved valuation model.",
+                ),
+            )
         return CompanyClassification(
             company_type="reit",
             supported=True,
@@ -96,7 +106,6 @@ def classify_company(
         _BANK_TERMS,
     )
     bank_sources = _unique((*bank_industry_sources, *bank_issuer_sources))
-    insurance_sources = _matching_sources(metadata, _INSURANCE_TERMS)
     ordinary_conflict_sources = _ordinary_conflict_sources(metadata)
 
     if bank_sources and insurance_sources:

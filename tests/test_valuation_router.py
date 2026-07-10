@@ -460,6 +460,47 @@ def test_supported_reit_takes_precedence_and_routes_only_to_reit_engine(
     assert calls == [fundamentals]
 
 
+def test_reit_with_insurer_metadata_is_unreliable_and_never_dispatches(
+    monkeypatch,
+):
+    fundamentals = _reit_fundamentals().model_copy(
+        update={"industry": "Insurance - Property"}, deep=True
+    )
+    calls: list[str] = []
+
+    def unexpected_engine(name: str):
+        def value(candidate: ValuationFundamentals) -> ModelResult:
+            calls.append(name)
+            pytest.fail(f"insurer conflict must not dispatch {name}")
+
+        return value
+
+    monkeypatch.setattr(
+        valuation_router,
+        "value_reit",
+        unexpected_engine("reit"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        unexpected_engine("bank"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        unexpected_engine("owner"),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+
+    assert classification.company_type == "unsupported"
+    assert classification.supported is False
+    assert "industry" in classification.sources
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(fundamentals)
+    assert calls == []
+
+
 def test_explicit_unsupported_type_precedes_reit_industry_metadata(monkeypatch):
     etf = _fundamentals(
         provider_security_type="ETF",
