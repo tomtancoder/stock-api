@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 
+from app.services.market_symbols import to_public_symbol, to_yahoo_symbol
 from app.services.yfinance_fundamentals import (
     build_valuation_metrics,
     get_valuation_metadata,
@@ -13,7 +14,7 @@ from app.services.yfinance_fundamentals import (
 
 def get_analysis(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
     public_timeframe = _normalize_timeframe(timeframe)
-    yahoo_symbol = _yahoo_symbol(exchange, symbol)
+    yahoo_symbol = to_yahoo_symbol(exchange, symbol)
     period, interval = _history_request(public_timeframe)
 
     try:
@@ -143,7 +144,7 @@ def _build_analysis(
     trend_state = _trend_state(rating)
 
     return {
-        "symbol": _public_symbol(exchange, original_symbol),
+        "symbol": to_public_symbol(exchange, original_symbol),
         "exchange": exchange.strip().upper(),
         "timeframe": timeframe,
         "source": "yfinance",
@@ -296,26 +297,6 @@ def _normalize_timeframe(timeframe: str) -> str:
         "1m": "1M",
         "1M": "1M",
     }.get(normalized_timeframe, normalized_timeframe)
-
-
-def _yahoo_symbol(exchange: str, symbol: str) -> str:
-    normalized_symbol = symbol.strip().upper()
-    provider_exchange = exchange.strip().lower()
-    if provider_exchange in {"tvc", "capitalcom"} and normalized_symbol in {"XAUUSD", "GOLD", "TVC:GOLD"}:
-        return "GC=F"
-    if provider_exchange == "sgx" and "." not in normalized_symbol:
-        return f"{normalized_symbol}.SI"
-    return normalized_symbol
-
-
-def _public_symbol(exchange: str, symbol: str) -> str:
-    normalized_exchange = exchange.strip().upper()
-    normalized_symbol = symbol.strip().upper()
-    if normalized_exchange == "SGX" and normalized_symbol.endswith(".SI"):
-        normalized_symbol = normalized_symbol[:-3]
-    if normalized_exchange in {"TVC", "CAPITALCOM"} and normalized_symbol in {"GOLD", "TVC:GOLD"}:
-        normalized_symbol = "XAUUSD"
-    return f"{normalized_exchange}:{normalized_symbol}"
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:

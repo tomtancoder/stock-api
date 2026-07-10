@@ -4,6 +4,7 @@ import math
 import os
 from typing import Any, Callable
 
+from app.services.market_symbols import to_public_symbol, to_yahoo_symbol
 from app.services.yfinance_analysis import get_analysis as get_yfinance_analysis
 
 
@@ -401,18 +402,7 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _quote_symbol(exchange: str, symbol: str) -> str:
-    normalized_symbol = _normalize_symbol(symbol)
-    if _is_gold_spot_alias(exchange, normalized_symbol):
-        return "GC=F"
-    if _provider_exchange(exchange) == "sgx" and "." not in normalized_symbol:
-        return f"{normalized_symbol}.SI"
-    return normalized_symbol
-
-
-def _is_gold_spot_alias(exchange: str, symbol: str) -> bool:
-    if _provider_exchange(exchange) not in {"tvc", "capitalcom"}:
-        return False
-    return symbol in {"XAUUSD", "GOLD", "TVC:GOLD"}
+    return to_yahoo_symbol(exchange, symbol)
 
 
 def _analysis_symbol(exchange: str, symbol: str) -> str:
