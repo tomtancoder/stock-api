@@ -434,9 +434,7 @@ A successful `SGX:D05` response uses the same common envelope as an ordinary-com
     "bull": 14.8,
     "margin_of_safety_price": 9.3,
     "price_to_base_value": 0.9516,
-    "upside_downside_percent": 5.08,
-    "price_to_margin_of_safety": 1.2688,
-    "upside_to_base_pct": 5.08
+    "upside_downside_percent": 5.08
   },
   "model_details": {
     "method": "bank_residual_income",
