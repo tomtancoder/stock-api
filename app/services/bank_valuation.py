@@ -1,5 +1,7 @@
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from statistics import median
 
 from app.services.valuation_math import validate_scenarios
@@ -19,6 +21,14 @@ _SCENARIO_INPUTS = {
 }
 
 
+def _is_finite_real(value: object) -> bool:
+    return (
+        isinstance(value, Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 @dataclass(frozen=True)
 class BankNormalizedInputs:
     common_equity: float
@@ -36,15 +46,17 @@ class BankNormalizedInputs:
             "book value per share": self.book_value_per_share,
         }
         for name, value in positive_values.items():
-            if not math.isfinite(value) or value <= 0:
+            if not _is_finite_real(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         if (
-            not math.isfinite(self.payout_ratio)
+            not _is_finite_real(self.payout_ratio)
             or not 0 <= self.payout_ratio <= 1
         ):
             raise ValueError("payout ratio must be finite and between 0 and 1")
-        if self.usable_years < 3:
-            raise ValueError("bank normalization requires three valid observations")
+        if type(self.usable_years) is not int or self.usable_years < 3:
+            raise ValueError(
+                "usable years must be an integer of at least three"
+            )
 
 
 def _select_annual_periods(
@@ -212,6 +224,22 @@ def _project_scenario(
     )
 
 
+def _sanitize_bank_metrics(
+    metrics: object,
+) -> tuple[dict[str, float], list[str]]:
+    if not isinstance(metrics, Mapping):
+        return {}, ["bank_metrics"]
+
+    valid_metrics: dict[str, float] = {}
+    ignored_metrics: list[str] = []
+    for key, value in metrics.items():
+        if key not in APPROVED_BANK_METRIC_KEYS or not _is_finite_real(value):
+            ignored_metrics.append(str(key))
+            continue
+        valid_metrics[key] = float(value)
+    return valid_metrics, sorted(set(ignored_metrics))
+
+
 def value_bank(fundamentals: ValuationFundamentals) -> ModelResult:
     normalized = normalize_bank_history(fundamentals)
     scenario_values: dict[str, float] = {}
@@ -231,8 +259,11 @@ def value_bank(fundamentals: ValuationFundamentals) -> ModelResult:
         scenario_values["bull"],
     )
 
+    bank_metrics, ignored_bank_metrics = _sanitize_bank_metrics(
+        fundamentals.bank_metrics
+    )
     missing_bank_metrics = sorted(
-        APPROVED_BANK_METRIC_KEYS - fundamentals.bank_metrics.keys()
+        APPROVED_BANK_METRIC_KEYS - bank_metrics.keys()
     )
     details: dict[str, object] = {
         "method": "bank_residual_income",
@@ -244,10 +275,33 @@ def value_bank(fundamentals: ValuationFundamentals) -> ModelResult:
     }
     details.update(
         {
-            metric: fundamentals.bank_metrics.get(metric)
+            metric: bank_metrics.get(metric)
             for metric in sorted(APPROVED_BANK_METRIC_KEYS)
         }
     )
+    warnings = list(fundamentals.warnings)
+    if missing_bank_metrics:
+        warnings.append(
+            "Missing optional bank metrics: "
+            f"{', '.join(missing_bank_metrics)}."
+        )
+    if ignored_bank_metrics:
+        warnings.append(
+            "Ignored invalid optional bank metrics: "
+            f"{', '.join(ignored_bank_metrics)}."
+        )
+    quality: dict[str, object] = {
+        "eligible": True,
+        "reasons": [],
+        "details": {
+            "usable_years": normalized.usable_years,
+            "available_bank_metrics": sorted(bank_metrics),
+            "missing_bank_metrics": missing_bank_metrics,
+            "ignored_bank_metrics": ignored_bank_metrics,
+        },
+    }
+    if missing_bank_metrics or ignored_bank_metrics:
+        quality["confidence"] = "medium"
     return ModelResult(
         method="bank_residual_income",
         detected_company_type="bank",
@@ -270,14 +324,6 @@ def value_bank(fundamentals: ValuationFundamentals) -> ModelResult:
                 ) in _SCENARIO_INPUTS.items()
             },
         },
-        quality={
-            "eligible": True,
-            "reasons": [],
-            "details": {
-                "usable_years": normalized.usable_years,
-                "available_bank_metrics": sorted(fundamentals.bank_metrics),
-                "missing_bank_metrics": missing_bank_metrics,
-            },
-        },
-        warnings=list(fundamentals.warnings),
+        quality=quality,
+        warnings=warnings,
     )

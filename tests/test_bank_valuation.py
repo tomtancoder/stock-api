@@ -1,16 +1,17 @@
 import math
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
 
-from app.services import bank_valuation, valuation_math
+from app.services import bank_valuation, valuation_math, valuation_service
 from app.services.bank_valuation import (
     BankNormalizedInputs,
     normalize_bank_history,
     value_bank,
 )
+from app.services.valuation_fundamentals import FundamentalsEnvelope
 from app.services.valuation_types import (
     FinancialPeriod,
     ModelResult,
@@ -196,6 +197,44 @@ def test_bank_normalized_inputs_are_immutable_and_validate_payout_bounds():
             )
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "common_equity",
+        "diluted_shares",
+        "normalized_roe",
+        "payout_ratio",
+        "book_value_per_share",
+    ],
+)
+def test_bank_normalized_inputs_reject_non_finite_numeric_fields(field):
+    values = {
+        "common_equity": 10_000.0,
+        "diluted_shares": 1_000.0,
+        "normalized_roe": 0.12,
+        "payout_ratio": 0.40,
+        "book_value_per_share": 10.0,
+        "usable_years": 5,
+    }
+    values[field] = float("nan")
+
+    with pytest.raises(ValueError, match="finite"):
+        BankNormalizedInputs(**values)
+
+
+@pytest.mark.parametrize("usable_years", [True, 3.0, float("nan")])
+def test_bank_normalized_inputs_require_real_integer_usable_years(usable_years):
+    with pytest.raises(ValueError, match="usable years"):
+        BankNormalizedInputs(
+            common_equity=10_000.0,
+            diluted_shares=1_000.0,
+            normalized_roe=0.12,
+            payout_ratio=0.40,
+            book_value_per_share=10.0,
+            usable_years=usable_years,
+        )
+
+
 def test_valuation_fundamentals_accepts_only_approved_bank_metric_keys():
     metrics = {
         "cet1_ratio": 0.14,
@@ -335,12 +374,89 @@ def test_value_bank_reports_missing_optional_metrics_without_blocking():
     assert result.details["loan_loss_coverage"] is None
     assert result.details["regulatory_capital_headroom"] is None
     assert result.quality["eligible"] is True
+    assert result.quality["confidence"] == "medium"
     assert result.quality["details"]["missing_bank_metrics"] == [
         "cet1_ratio",
         "loan_loss_coverage",
         "npl_ratio",
         "regulatory_capital_headroom",
     ]
+    assert result.warnings == [
+        "Missing optional bank metrics: cet1_ratio, loan_loss_coverage, "
+        "npl_ratio, regulatory_capital_headroom."
+    ]
+
+
+def test_missing_metrics_cap_five_year_official_confidence_at_medium():
+    fundamentals = _fundamentals(
+        _bank_periods(
+            [
+                7_500.0,
+                8_000.0,
+                8_500.0,
+                9_000.0,
+                9_500.0,
+                10_000.0,
+            ]
+        ),
+        primary_source="sec_companyfacts",
+    )
+    result = value_bank(fundamentals)
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    envelope = FundamentalsEnvelope(
+        fundamentals=fundamentals,
+        fresh_until=now + timedelta(days=1),
+        stale_until=now + timedelta(days=7),
+        stale=False,
+        warnings=(),
+    )
+
+    assert result.details["usable_years"] == 5
+    assert result.quality["confidence"] == "medium"
+    assert valuation_service._confidence(fundamentals, envelope, result) == (
+        "medium"
+    )
+
+
+def test_value_bank_sanitizes_mutated_optional_metrics():
+    fundamentals = _fundamentals(
+        _bank_periods([8_000.0, 8_500.0, 9_000.0, 9_500.0, 10_000.0]),
+        bank_metrics={
+            "cet1_ratio": 0.14,
+            "npl_ratio": 0.02,
+            "loan_loss_coverage": 1.5,
+            "regulatory_capital_headroom": 0.03,
+        },
+    )
+    fundamentals.bank_metrics["cet1_ratio"] = float("nan")
+    fundamentals.bank_metrics["npl_ratio"] = True
+    fundamentals.bank_metrics["loan_loss_coverage"] = "1.5"
+    fundamentals.bank_metrics["tier1_ratio"] = 0.15
+
+    result = value_bank(fundamentals)
+
+    assert result.details["cet1_ratio"] is None
+    assert result.details["npl_ratio"] is None
+    assert result.details["loan_loss_coverage"] is None
+    assert result.details["regulatory_capital_headroom"] == 0.03
+    assert "tier1_ratio" not in result.details
+    assert result.quality["confidence"] == "medium"
+    assert result.quality["details"]["available_bank_metrics"] == [
+        "regulatory_capital_headroom"
+    ]
+    assert result.quality["details"]["missing_bank_metrics"] == [
+        "cet1_ratio",
+        "loan_loss_coverage",
+        "npl_ratio",
+    ]
+    warning_text = " ".join(result.warnings)
+    for metric in (
+        "cet1_ratio",
+        "loan_loss_coverage",
+        "npl_ratio",
+        "tier1_ratio",
+    ):
+        assert metric in warning_text
 
 
 def test_value_bank_calls_shared_scenario_validation(monkeypatch):
