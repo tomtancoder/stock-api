@@ -1,6 +1,6 @@
 # Trading Intelligence API
 
-FastAPI API for market quotes, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.
+FastAPI API for market quotes, owner-earnings intrinsic valuation, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.
 
 For external application integration details, endpoint samples, response shapes, and client examples, see [API_DOCUMENTATION.md](API_DOCUMENTATION.md).
 
@@ -25,6 +25,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /health`
 - `GET /api/v1/markets/{exchange}/{symbol}/quote`
 - `GET /api/v1/markets/{exchange}/{symbol}/analysis?timeframe=1D`
+- `GET /api/v1/markets/{exchange}/{symbol}/valuation`
 - `GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D&include_multi_timeframe=false`
 - `GET /api/v1/markets/{exchange}/gainers`
 - `GET /api/v1/markets/{exchange}/losers`
@@ -42,11 +43,12 @@ Legacy stock routes remain as compatibility aliases:
 - `GET /api/v1/stocks/{symbol}/technicals`
 - `POST /api/v1/stocks/{symbol}/valuation`
 
-`GET /api/v1/stocks/{symbol}/fundamentals` and `POST /api/v1/stocks/{symbol}/valuation` return `501`; fundamentals and valuation are not part of the current API surface.
+`GET /api/v1/stocks/{symbol}/fundamentals` and the legacy `POST /api/v1/stocks/{symbol}/valuation` return `501`. The legacy POST is not an alias for the canonical market valuation GET.
 
 Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
 Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
 Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available. A cached TradingView scanner lookup also adds trailing P/E and 52-week high/low. These reference fields are nullable and do not make `/technical` depend on yFinance.
+Valuation responses use financial statements and a separately refreshed current quote. The implemented foundation values ordinary operating companies with an owner-earnings DCF; recognized banks and REITs currently return `valuation_unreliable` without running that model.
 
 ## Markets
 
@@ -54,9 +56,10 @@ Exchange codes are mapped to Yahoo-compatible symbols where needed. For Singapor
 
 - Quote: `GET /api/v1/markets/SGX/D05/quote`
 - Analysis: `GET /api/v1/markets/SGX/D05/analysis?timeframe=1D`
+- Valuation: `GET /api/v1/markets/SGX/S63/valuation`
 - Technical: `GET /api/v1/markets/SGX/D05/technical?timeframe=1D`
 
-The provider also accepts Yahoo-style Singapore symbols such as `D05.SI` for analysis and technical routes, and returns public symbols such as `SGX:D05`. Market-wide SGX scanners still depend on the symbol universe available from the TradingView MCP package.
+The provider also accepts Yahoo-style Singapore symbols such as `S63.SI` for valuation and returns public symbols such as `SGX:S63`. The same normalization remains available to analysis and technical routes. Market-wide SGX scanners still depend on the symbol universe available from the TradingView MCP package.
 
 For spot gold, use `TVC` with `XAUUSD`:
 
@@ -66,6 +69,59 @@ For spot gold, use `TVC` with `XAUUSD`:
 - Backtest: `POST /api/v1/backtests/TVC/XAUUSD`
 
 yfinance-backed quote, analysis, and backtest data resolves this to `GC=F`. TradingView MCP technical analysis resolves `XAUUSD` to TradingView's `TVC:GOLD` feed.
+
+## Intrinsic Valuation
+
+The implemented endpoint is:
+
+```http
+GET /api/v1/markets/{exchange}/{symbol}/valuation
+```
+
+Ordinary-company examples:
+
+```text
+GET /api/v1/markets/NASDAQ/AAPL/valuation
+GET /api/v1/markets/SGX/S63/valuation
+```
+
+The current foundation recognizes company type automatically and supports only ordinary operating companies with `method: "owner_earnings_dcf"`. Banks and REITs are recognized but do not have an implemented model in this foundation; they return HTTP `200` with `status: "valuation_unreliable"`, reasons under `quality.reasons`, and no method or intrinsic-value claim. Unsupported or ambiguous securities behave the same way. The API does not fall back to an ordinary-company DCF for a bank or REIT.
+
+For every usable annual or trailing period, the model calculates:
+
+```text
+owner earnings = operating cash flow
+               - maintenance capex
+               - stock-based compensation
+               - interest paid outside operating cash flow
+```
+
+Operating cash flow already includes working-capital movements, so working capital is not subtracted again. Total capital expenditure is the current conservative maintenance-capex proxy. Stock-based compensation is treated as an owner expense, and IFRS interest classified in financing is subtracted once. At least three positive annual periods are required and five are preferred. The normalized starting value is the median of at least two available components: trailing owner earnings, a weighted three-year average, and a five-year median owner-earnings margin applied to trailing revenue.
+
+The model projects ten years and fades growth toward the terminal rate:
+
+| Scenario | Starting owner earnings | Initial growth | Required return | Terminal growth |
+| --- | ---: | ---: | ---: | ---: |
+| Bear | 90% of normalized | Derived growth minus 4 points, floor -20% | 12% | 2% |
+| Base | 100% of normalized | Derived growth, clamped to -15% through 12% | 10% | 2.5% |
+| Bull | 105% of normalized | Derived growth plus 3 points, cap 15% | 8% | 3% |
+
+Owner earnings are after interest and are discounted directly to equity value, then divided by current diluted shares. The foundation does not subtract debt again or add an automatic excess-cash adjustment.
+
+The response reports finite positive `bear`, `base`, and `bull` values ordered from low to high. `margin_of_safety_price` is 75% of base intrinsic value. Price labels use this precedence:
+
+1. `very_expensive` when current price is above bull intrinsic value.
+2. `expensive` when current price is above 110% of base intrinsic value.
+3. `cheap` when current price is at or below the margin-of-safety price.
+4. `fair` otherwise.
+
+`sources` provides field-level provider identifiers, including `current_price: "existing_quote_provider"`. `data_quality` reports `primary_source`, `financials_as_of`, `valuation_as_of`, `next_refresh_at`, `stale`, and `missing_fields`; `price_as_of` is a separate top-level timestamp. U.S. fundamentals use SEC Company Facts first only when `STOCK_API_SEC_USER_AGENT` is configured. Otherwise the endpoint uses yFinance fallback fundamentals, adds a warning, and cannot return high confidence. SGX fundamentals use yFinance, preserve `SGD`, and are capped at medium confidence; missing facts or stale data can lower confidence further.
+
+Normalized fundamentals and intrinsic scenarios refresh once daily by default, while the current quote refreshes independently every five minutes. If a fundamentals refresh fails while a usable cached entry remains inside the stale window, the endpoint returns it with `data_quality.stale: true`, a warning, and low confidence. Without usable cached data, provider failure returns `502`; unresolved symbols return `404`.
+
+yFinance is an unofficial, provider-dependent source that may be incomplete, delayed, or unavailable. Production deployments that require guaranteed market-data rights or service levels should replace it through the existing provider boundary with an appropriately licensed source.
+
+Intrinsic valuation is strictly separate from `/technical`: `/valuation` does not consume TradingView indicators, scores, sentiment, or signals, and `/technical` does not consume valuation output. `/analysis` also remains a separate yFinance OHLCV and P/E endpoint. The legacy stock valuation POST remains `501`.
 
 ## Technical Analysis
 
@@ -81,6 +137,17 @@ TradingView's internal bulk scanner is useful for candidate lists because it fet
 $env:STOCK_API_DEFAULT_EXCHANGE = "NASDAQ"
 $env:STOCK_API_DEFAULT_TIMEFRAME = "1D"
 ```
+
+Valuation configuration (defaults shown; provide the SEC identity to use SEC fundamentals):
+
+```powershell
+$env:STOCK_API_SEC_USER_AGENT = "stock-api your-email@example.com"
+$env:STOCK_API_VALUATION_CACHE_TTL_SECONDS = "86400"
+$env:STOCK_API_VALUATION_QUOTE_TTL_SECONDS = "300"
+$env:STOCK_API_VALUATION_STALE_TTL_SECONDS = "604800"
+```
+
+The SEC requires an identifying user agent. If `STOCK_API_SEC_USER_AGENT` is absent, U.S. valuations use the documented yFinance fallback instead of calling SEC endpoints.
 
 Useful TradingView MCP tuning variables:
 
@@ -121,6 +188,14 @@ Run optional live provider checks only when explicitly enabled:
 ```powershell
 $env:RUN_LIVE_TRADINGVIEW_TESTS = "1"
 .\.venv\Scripts\python.exe -m pytest -m live -q
+```
+
+Run the opt-in live ordinary-company valuation smoke tests separately:
+
+```powershell
+$env:STOCK_API_SEC_USER_AGENT = "stock-api your-email@example.com"
+$env:RUN_LIVE_VALUATION_TESTS = "1"
+.\.venv\Scripts\python.exe -m pytest tests\test_live_valuation.py -q
 ```
 
 ## Deployment
