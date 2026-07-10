@@ -1,7 +1,7 @@
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class QuoteResponse(BaseModel):
@@ -51,12 +51,18 @@ class WalkForwardBacktestRequest(BaseModel):
 
 
 class IntrinsicValueRange(BaseModel):
-    bear: float
-    base: float
-    bull: float
+    bear: float = Field(gt=0, allow_inf_nan=False)
+    base: float = Field(gt=0, allow_inf_nan=False)
+    bull: float = Field(gt=0, allow_inf_nan=False)
     margin_of_safety_price: float
     price_to_base_value: float
     upside_downside_percent: float
+
+    @model_validator(mode="after")
+    def validate_scenario_order(self) -> Self:
+        if not self.bear <= self.base <= self.bull:
+            raise ValueError("intrinsic values must satisfy bear <= base <= bull")
+        return self
 
 
 class ValuationDataQuality(BaseModel):
@@ -74,12 +80,23 @@ class ValuationQuality(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class OwnerEarningsHistoryEntry(BaseModel):
+    period_end: date
+    currency: str
+    operating_cash_flow: float = Field(allow_inf_nan=False)
+    maintenance_capex: float = Field(ge=0, allow_inf_nan=False)
+    maintenance_capex_method: str
+    stock_based_compensation: float = Field(ge=0, allow_inf_nan=False)
+    interest_paid_outside_operating: float = Field(ge=0, allow_inf_nan=False)
+    owner_earnings: float = Field(allow_inf_nan=False)
+
+
 class OwnerEarningsValuationDetails(BaseModel):
     method: Literal["owner_earnings_dcf"]
     normalized_owner_earnings: float
     owner_earnings_per_share: float
     maintenance_capex_method: str
-    annual_history: list[dict[str, Any]] = Field(default_factory=list)
+    annual_history: list[OwnerEarningsHistoryEntry] = Field(default_factory=list)
     derived_growth: float
     usable_years: int
 
@@ -87,7 +104,7 @@ class OwnerEarningsValuationDetails(BaseModel):
 class ValuationResponse(BaseModel):
     symbol: str
     exchange: str
-    currency: str | None = None
+    currency: str
     detected_company_type: str
     method: str | None = None
     classification_sources: list[str] = Field(default_factory=list)
@@ -99,8 +116,8 @@ class ValuationResponse(BaseModel):
         "valuation_unreliable",
     ]
     confidence: Literal["high", "medium", "low"] | None = None
-    current_price: float | None = None
-    price_as_of: datetime | None = None
+    current_price: float = Field(gt=0, allow_inf_nan=False)
+    price_as_of: datetime
     intrinsic_value: IntrinsicValueRange | None = None
     model_details: OwnerEarningsValuationDetails | None = None
     quality: ValuationQuality
@@ -108,3 +125,20 @@ class ValuationResponse(BaseModel):
     data_quality: ValuationDataQuality
     sources: dict[str, str] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_status_claims(self) -> Self:
+        claims = (
+            self.method,
+            self.confidence,
+            self.intrinsic_value,
+            self.model_details,
+        )
+        if self.status == "valuation_unreliable":
+            if any(claim is not None for claim in claims):
+                raise ValueError(
+                    "valuation_unreliable responses must omit valuation claims"
+                )
+        elif any(claim is None for claim in claims):
+            raise ValueError("reliable valuation responses require valuation claims")
+        return self
