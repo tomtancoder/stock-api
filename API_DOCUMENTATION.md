@@ -322,7 +322,7 @@ The analysis response is calculated locally from yfinance OHLCV history and can 
 GET /api/v1/markets/{exchange}/{symbol}/valuation
 ```
 
-This canonical GET automatically classifies the security and selects the model; clients cannot force a method or supply assumptions. Ordinary operating companies use `owner_earnings_dcf`, and eligible banks use `bank_residual_income`.
+This canonical GET automatically classifies the security and selects the model; clients cannot force a method or supply assumptions. Ordinary operating companies use `owner_earnings_dcf`, eligible banks use `bank_residual_income`, and eligible REITs/property trusts use `reit_distribution_nav` or its documented `reit_distribution_only` fallback.
 
 U.S. and SGX examples:
 
@@ -330,9 +330,10 @@ U.S. and SGX examples:
 curl "http://127.0.0.1:8000/api/v1/markets/NASDAQ/AAPL/valuation"
 curl "http://127.0.0.1:8000/api/v1/markets/SGX/S63/valuation"
 curl "http://127.0.0.1:8000/api/v1/markets/SGX/D05/valuation"
+curl "http://127.0.0.1:8000/api/v1/markets/SGX/C38U/valuation"
 ```
 
-For SGX, both bare and Yahoo-style symbols are accepted. For example, `D05` and `D05.SI` both normalize provider access to `D05.SI`, return public symbol `SGX:D05`, and preserve `SGD` for price and per-share values.
+For SGX, both bare and Yahoo-style symbols are accepted. For example, `D05` and `D05.SI` both normalize provider access to `D05.SI`, return public symbol `SGX:D05`, and preserve `SGD` for price and per-share values. The same rule applies to REIT symbols such as `C38U` and `C38U.SI`, which return `SGX:C38U`.
 
 Current company-type behavior:
 
@@ -340,10 +341,11 @@ Current company-type behavior:
 | --- | --- | --- |
 | Ordinary operating company | `owner_earnings_dcf` | Three finite positive intrinsic values when inputs are eligible |
 | Bank | `bank_residual_income` | Three finite positive intrinsic values when bank inputs are eligible |
-| REIT or property trust | none | HTTP `200`, `status: "valuation_unreliable"` |
+| REIT or property trust with usable DPU and NAV | `reit_distribution_nav` | Three finite positive intrinsic values |
+| REIT or property trust with usable DPU but no NAV | `reit_distribution_only` | Lower-confidence finite values using a Gordon terminal distribution |
 | Unsupported or ambiguous | none | HTTP `200`, `status: "valuation_unreliable"` |
 
-Banks and REITs are recognized so they cannot accidentally enter owner-earnings DCF. Eligible banks now dispatch to residual income; a bank that fails its required-input checks returns `valuation_unreliable` and never falls back to owner earnings. An unreliable response sets `method`, `confidence`, `intrinsic_value`, and `model_details` to `null`, sets `quality.eligible` to `false`, and explains the refusal in `quality.reasons`. REITs, insurers, funds, commodities, cryptocurrencies, pre-revenue companies, incompatible currencies or units, and insufficient required facts can also produce this non-numerical result.
+Classification uses explicit security/quote type, sector and industry, issuer/filing classification, and compatible statement structure; issuer-name patterns are only supporting evidence. REIT/property-trust evidence takes priority over a broad financial or real-estate label. A bank requires explicit bank-industry metadata plus compatible bank-like statements. Banks and REITs are recognized so they cannot accidentally enter owner-earnings DCF. A failed bank or REIT calculation never falls back to owner earnings. Insurers, ETFs, mutual funds, commodities, cryptocurrencies, pre-revenue companies, incompatible currencies/units, ambiguous classifications, and insufficient required facts return the non-numerical `valuation_unreliable` result. It sets `method`, `confidence`, `intrinsic_value`, and `model_details` to `null`, sets `quality.eligible` to `false`, and gives explicit reasons in `quality.reasons` and/or `data_quality.missing_fields`.
 
 #### Owner-Earnings Method
 
@@ -411,7 +413,9 @@ CET1 ratio, non-performing-loan ratio, loan-loss coverage, and reported regulato
 
 Bank deposits, borrowings, and regulatory liquidity are operating/funding inputs rather than industrial-company financing adjustments. The bank model therefore does not calculate ordinary-company owner earnings, subtract working-capital movements, or subtract bank debt from residual-income equity value. It starts from common equity and after-interest common net income, so those ordinary-company adjustments would mix models and double count financing effects.
 
-A successful `SGX:D05` response uses the same common envelope as an ordinary-company valuation. This schema excerpt is illustrative, the projected arrays are shortened, and market-dependent values are not API constants:
+#### Illustrative response: SGX bank
+
+A successful `SGX:D05` response uses the same common envelope as an ordinary-company valuation. This illustrative schema excerpt uses sample values; projected arrays are shortened and market-dependent values are not API constants:
 
 ```json
 {
@@ -456,6 +460,27 @@ A successful `SGX:D05` response uses the same common envelope as an ordinary-com
 }
 ```
 
+#### REIT Distribution-And-NAV Method
+
+The REIT engine values distributions and NAV per unit, not ordinary-company owner earnings:
+
+```text
+intrinsic value per unit = PV of ten annual DPU payments
+                         + PV of terminal NAV per unit
+```
+
+Required inputs are at least three usable annual DPU observations, positive current units, current price, and a compatible reporting currency. NAV per unit is required for `reit_distribution_nav`; issuer-reported DPU/NAV is preferred, and missing facts never become zero. Starting DPU is the median of available independent components: latest trailing DPU, weighted three-year DPU (weights 1, 2, 3 from oldest to newest), and five-year median DPU. Base DPU growth is clamped to -3% through 3%; base NAV growth is clamped to -2% through 2.5%. The engine projects and discounts ten DPU payments, projects terminal NAV for ten years, applies the scenario terminal-NAV factor, and exposes the distribution and terminal present values separately.
+
+| Scenario | Starting DPU | DPU growth | Required return | NAV growth | Terminal NAV factor |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bear | 90% of normalized | Base minus 2 points, floor -5% | 10% | Base minus 1 point, clamped -2% through 2.5% | 85% |
+| Base | 100% of normalized | Base, clamped -3% through 3% | 8.5% | Base, clamped -2% through 2.5% | 100% |
+| Bull | 105% of normalized | Base plus 2 points, cap 5% | 7% | Base plus 1 point, clamped -2% through 2.5% | 110% |
+
+When NAV is unavailable but DPU history is sufficient, `reit_distribution_only` instead adds a Gordon terminal distribution value, `DPU10 * (1 + terminal_growth) / (required_return - terminal_growth)`, discounted from year 10. Terminal distribution growth is 0%, 1.5%, and 2.5% for bear, base, and bull; required return must exceed terminal growth. This is an explicitly supported partial result with `low` confidence. Without sufficient DPU history, the result is `valuation_unreliable`, not an ordinary-company or bank fallback.
+
+Optional quality facts are aggregate leverage, interest coverage, occupancy, weighted average lease expiry, recurring property capex, and material currency exposure. They appear in `model_details`, provenance, warnings, and quality details when available; missing optional facts can lower confidence without invalidating a complete DPU/NAV calculation.
+
 #### Price Classification
 
 The endpoint compares the independently refreshed current quote with base intrinsic value:
@@ -483,11 +508,13 @@ A reliable response contains:
 - `detected_company_type`, `method`, `classification_sources`, `status`, and `confidence`.
 - `current_price` and a separate `price_as_of` timestamp.
 - `intrinsic_value` with bear, base, bull, margin-of-safety price, price-to-base ratio, and upside/downside percentage.
-- Model-specific `model_details`: owner-earnings normalization/history for ordinary companies, or normalized ROE, book value per share, payout, projected book equity, and optional quality ratios for banks.
+- Model-specific `model_details`: owner-earnings normalization/history for ordinary companies; normalized ROE, book value per share, payout, projected book equity, and optional quality ratios for banks; or normalized DPU, NAV, distribution yield, optional REIT quality facts, and distribution-versus-terminal present values for REITs.
 - Fixed model `assumptions`, `quality`, field-level `sources`, and `warnings`.
 - `data_quality.primary_source`, `financials_as_of`, `valuation_as_of`, `next_refresh_at`, `stale`, and `missing_fields`.
 
-Illustrative response shape (annual history and the source map are shortened for readability):
+#### Illustrative response: ordinary U.S. company
+
+This illustrative response shape uses sample values; annual history and the source map are shortened for readability:
 
 ```json
 {
@@ -580,7 +607,94 @@ Illustrative response shape (annual history and the source map are shortened for
 }
 ```
 
-`sources` records the provider selected for each normalized field, not just a response-wide source label. U.S. fundamentals prefer SEC Company Facts when `STOCK_API_SEC_USER_AGENT` is configured. Missing compatible SEC facts may be filled at the fundamentals facade from a same-currency, same-period yFinance fact while retaining its field-level source. If the SEC user agent is not configured, U.S. requests use yFinance fundamentals, include an explicit fallback warning, and cannot receive high confidence. SGX uses yFinance fundamentals and is capped at medium confidence. Any reported missing fields, material model gaps, or stale inputs lower confidence.
+#### Illustrative response: ordinary SGX company
+
+This illustrative `SGX:S63` response demonstrates the public symbol and SGD contract; values are examples only:
+
+```json
+{
+  "symbol": "SGX:S63",
+  "exchange": "SGX",
+  "currency": "SGD",
+  "detected_company_type": "operating_company",
+  "method": "owner_earnings_dcf",
+  "status": "fair",
+  "confidence": "medium",
+  "current_price": 7.15,
+  "intrinsic_value": {
+    "bear": 5.8,
+    "base": 7.5,
+    "bull": 9.1,
+    "margin_of_safety_price": 5.625,
+    "price_to_base_value": 0.9533,
+    "upside_downside_percent": 4.9
+  },
+  "data_quality": {
+    "primary_source": "yfinance_sgx",
+    "stale": false,
+    "missing_fields": []
+  },
+  "sources": {
+    "operating_cash_flow": "yfinance",
+    "current_price": "existing_quote_provider"
+  }
+}
+```
+
+#### Illustrative response: SGX REIT
+
+This illustrative `SGX:C38U` response shows the complete DPU-and-NAV method; values are examples only:
+
+```json
+{
+  "symbol": "SGX:C38U",
+  "exchange": "SGX",
+  "currency": "SGD",
+  "detected_company_type": "reit",
+  "method": "reit_distribution_nav",
+  "status": "cheap",
+  "confidence": "medium",
+  "current_price": 1.85,
+  "intrinsic_value": {
+    "bear": 1.9,
+    "base": 2.2,
+    "bull": 2.6,
+    "margin_of_safety_price": 1.65,
+    "price_to_base_value": 0.8409,
+    "upside_downside_percent": 18.9
+  },
+  "model_details": {
+    "method": "reit_distribution_nav",
+    "normalized_dpu": 0.105,
+    "nav_per_unit": 2.08,
+    "price_to_nav": 0.8894,
+    "distribution_yield": 0.0568,
+    "usable_years": 5,
+    "present_value_distributions": {
+      "bear": 0.62,
+      "base": 0.82,
+      "bull": 1.05
+    },
+    "present_value_terminal": {
+      "bear": 1.28,
+      "base": 1.38,
+      "bull": 1.55
+    }
+  },
+  "data_quality": {
+    "primary_source": "yfinance_sgx",
+    "stale": false,
+    "missing_fields": []
+  },
+  "sources": {
+    "distribution_per_unit": "yfinance",
+    "nav_per_unit": "yfinance",
+    "current_price": "existing_quote_provider"
+  }
+}
+```
+
+`sources` records the provider selected for each normalized field, not just a response-wide source label. U.S. fundamentals prefer SEC Company Facts when `STOCK_API_SEC_USER_AGENT` is configured. Missing compatible SEC facts may be filled at the fundamentals facade from a same-currency, same-period yFinance fact while retaining its field-level source. If the SEC user agent is not configured, U.S. requests use yFinance fundamentals, include an explicit fallback warning, and cannot receive high confidence. SGX uses yFinance fundamentals and is capped at medium confidence. `high` requires official primary facts, five usable years, compatible inputs, and no material model conflict; `medium` covers complete three-year results and consistent SGX/yFinance inputs; `low` covers stale inputs, material optional-data gaps, and the supported REIT distribution-only fallback. Missing required inputs always return `valuation_unreliable` rather than an invented low-confidence value.
 
 Fundamentals and intrinsic scenarios use the daily valuation cache (`86400` seconds by default). Quotes use a separate five-minute cache (`300` seconds by default), so price-dependent ratios and labels can change without recalculating intrinsic value. A changed normalized-fundamentals timestamp or model version invalidates the model result.
 
@@ -590,7 +704,7 @@ yFinance is an unofficial, provider-dependent source and may be incomplete, dela
 
 #### Separation From Technical Analysis
 
-`/valuation` is fundamentals-based and does not consume TradingView MCP indicators, scores, sentiment, trade setups, or multi-timeframe signals. `/technical` remains a TradingView MCP endpoint with its own provider cache and does not consume intrinsic values. `/analysis` remains separate yFinance OHLCV/P/E analysis. The legacy `POST /api/v1/stocks/{symbol}/valuation` remains `501` and is not an alias for this GET route.
+`/valuation` is fundamentals-based and does not consume TradingView MCP indicators, scores, sentiment, trade setups, or multi-timeframe signals. `/technical` remains a TradingView MCP endpoint with its own provider cache and does not consume intrinsic values. `/analysis` remains separate yFinance OHLCV/P/E analysis, while `/quote` supplies the independently refreshed current price. The legacy `POST /api/v1/stocks/{symbol}/valuation` remains retired at `501` and is not an alias for this GET route.
 
 ### TradingView MCP Technical Analysis
 
@@ -1099,7 +1213,7 @@ $env:MARKETAUX_API_TOKEN = "..."
 - Prefer `/api/v1/markets/...` for all new applications.
 - The legacy `/api/v1/stocks/...` endpoints may be removed in a future breaking version.
 - Intrinsic valuation and price labels are model estimates, not investment advice.
-- Bank residual-income valuation is implemented; REITs and failed bank eligibility checks still require explicit `valuation_unreliable` handling.
+- Ordinary-company, bank, and REIT intrinsic valuations are model-routed automatically; failed eligibility checks require explicit `valuation_unreliable` handling.
 - Keep intrinsic valuation separate from TradingView technical signals in client decision logic.
 - Backtest results are historical simulations and are not predictive.
 - Market-wide screeners can be unavailable for markets where TradingView MCP does not provide a usable symbol universe.

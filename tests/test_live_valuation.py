@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
 from app.main import app
-from app.schemas import BankValuationDetails, ValuationResponse
+from app.schemas import BankValuationDetails, ReitValuationDetails, ValuationResponse
 from app.services import sec_companyfacts
 from app.services import valuation_fundamentals
 from app.services import valuation_service
@@ -147,3 +147,39 @@ def test_live_sgx_bank_valuation() -> None:
         for field in required_bank_source_fields
     )
     assert valuation.sources.get("current_price") == "existing_quote_provider"
+
+
+def test_live_sgx_reit_valuation() -> None:
+    """Smoke-test a liquid SGX REIT while accepting live filing-data gaps."""
+    with TestClient(app) as client:
+        response = client.get("/api/v1/markets/SGX/C38U/valuation")
+
+    assert response.status_code == 200, response.text
+    valuation = ValuationResponse.model_validate(response.json())
+    assert valuation.symbol == "SGX:C38U"
+    assert valuation.currency == "SGD"
+    assert valuation.detected_company_type == "reit"
+    assert valuation.data_quality.primary_source == "yfinance_sgx"
+    assert valuation.sources.get("current_price") == "existing_quote_provider"
+
+    if valuation.status == "valuation_unreliable":
+        assert valuation.quality.eligible is False
+        assert valuation.quality.reasons or valuation.data_quality.missing_fields
+        return
+
+    assert valuation.method in {
+        "reit_distribution_nav",
+        "reit_distribution_only",
+    }
+    assert isinstance(valuation.model_details, ReitValuationDetails)
+    assert "distribution_per_unit" in valuation.sources
+
+    intrinsic_value = valuation.intrinsic_value
+    assert intrinsic_value is not None
+    scenario_values = (
+        intrinsic_value.bear,
+        intrinsic_value.base,
+        intrinsic_value.bull,
+    )
+    assert all(math.isfinite(value) and value > 0 for value in scenario_values)
+    assert scenario_values[0] <= scenario_values[1] <= scenario_values[2]
