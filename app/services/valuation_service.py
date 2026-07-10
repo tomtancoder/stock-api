@@ -61,7 +61,8 @@ class _ModelCacheEntry:
 @dataclass(frozen=True, slots=True)
 class _QuoteCacheEntry:
     payload: dict[str, Any]
-    expires_at: float
+    fresh_deadline: float
+    stale_deadline: float
 
 
 @dataclass(slots=True)
@@ -92,6 +93,7 @@ _QUOTE_CACHE: dict[_QuoteCacheKey, _QuoteCacheEntry] = {}
 _QUOTE_IN_FLIGHT: dict[_QuoteCacheKey, _QuoteFlight] = {}
 _QUOTE_GENERATION = 0
 _QUOTE_CACHE_LOCK = Lock()
+_QUOTE_STALE_WARNING_KEY = "__valuation_quote_stale_warning__"
 
 
 def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
@@ -118,6 +120,8 @@ def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
         unreliable_reasons.extend(classification.reasons)
 
     quote = _get_quote(venue, provider_symbol, public_symbol)
+    quote_stale_warning = quote.pop(_QUOTE_STALE_WARNING_KEY, None)
+    quote_stale = isinstance(quote_stale_warning, str)
     current_price = _quote_price(quote)
     fundamentals_currency = _currency(
         fundamentals.currency, "Fundamentals currency is missing or invalid."
@@ -139,6 +143,7 @@ def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
         envelope.warnings,
         model_result.warnings if model_result is not None else (),
         quote.get("warnings"),
+        (quote_stale_warning,) if quote_stale else (),
         (timestamp_warning,) if timestamp_warning else (),
     )
     sources = _sources(fundamentals)
@@ -160,7 +165,7 @@ def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
             "financials_as_of": _financials_as_of(fundamentals),
             "valuation_as_of": valuation_as_of,
             "next_refresh_at": _as_utc(envelope.fresh_until),
-            "stale": envelope.stale,
+            "stale": envelope.stale or quote_stale,
             "missing_fields": _unique(missing_fields),
         },
         "sources": sources,
@@ -220,7 +225,10 @@ def _get_fundamentals(
     except SecCompanyFactsError as exc:
         status_code = 404 if exc.status_code == 404 else 502
         raise ValuationServiceError(
-            str(exc), status_code=status_code, reasons=[str(exc)]
+            str(exc),
+            status_code=status_code,
+            retry_after_s=exc.retry_after_s,
+            reasons=[str(exc)],
         ) from exc
     except YFinanceStatementsError as exc:
         raise ValuationServiceError(
@@ -387,13 +395,19 @@ def _get_quote(
 ) -> dict[str, Any]:
     key = (exchange, public_symbol)
     flight: _QuoteFlight
+    stale_entry: _QuoteCacheEntry | None
     while True:
         now = monotonic()
         with _QUOTE_CACHE_LOCK:
             cached = _QUOTE_CACHE.get(key)
-            if cached is not None and now < cached.expires_at:
+            if cached is not None and now < cached.fresh_deadline:
                 return deepcopy(cached.payload)
-            if cached is not None:
+            stale_entry = (
+                cached
+                if cached is not None and now < cached.stale_deadline
+                else None
+            )
+            if cached is not None and stale_entry is None:
                 del _QUOTE_CACHE[key]
             flight = _QUOTE_IN_FLIGHT.get(key)
             if flight is None:
@@ -410,13 +424,20 @@ def _get_quote(
 
     try:
         normalized = _fetch_quote_uncached(exchange, symbol)
-        ttl = int(get_settings().valuation_quote_ttl_seconds)
+        settings = get_settings()
+        fresh_ttl = int(settings.valuation_quote_ttl_seconds)
+        stale_ttl = max(
+            fresh_ttl,
+            int(getattr(settings, "valuation_stale_ttl_seconds", fresh_ttl)),
+        )
+        stored_at = monotonic()
         entry = _QuoteCacheEntry(
             payload=deepcopy(normalized),
-            expires_at=monotonic() + ttl,
+            fresh_deadline=stored_at + fresh_ttl,
+            stale_deadline=stored_at + stale_ttl,
         )
     except BaseException as exc:  # noqa: BLE001 - release all waiters.
-        return _complete_failed_quote(key, flight, exc)
+        return _complete_failed_quote(key, flight, exc, stale_entry)
     return _complete_successful_quote(key, flight, normalized, entry)
 
 
@@ -469,12 +490,30 @@ def _complete_failed_quote(
     key: _QuoteCacheKey,
     flight: _QuoteFlight,
     exc: BaseException,
+    stale_entry: _QuoteCacheEntry | None,
 ):
     with _QUOTE_CACHE_LOCK:
+        result: dict[str, Any] | None = None
+        error: BaseException | None = exc
+        if (
+            stale_entry is not None
+            and isinstance(exc, ValuationServiceError)
+            and exc.status_code == 502
+        ):
+            warning = (
+                "Quote refresh failed; serving stale cached data: "
+                f"{exc.detail}"
+            )
+            result = deepcopy(stale_entry.payload)
+            result[_QUOTE_STALE_WARNING_KEY] = warning
+            error = None
         if _QUOTE_IN_FLIGHT.get(key) is flight:
             del _QUOTE_IN_FLIGHT[key]
-        flight.error = exc
+        flight.result = result
+        flight.error = error
         flight.event.set()
+    if result is not None:
+        return deepcopy(result)
     raise exc
 
 

@@ -375,6 +375,46 @@ def test_market_valuation_endpoint_preserves_retry_after_on_502(monkeypatch):
     assert response.json()["detail"] == "Quote provider is busy."
 
 
+def test_market_valuation_endpoint_propagates_sec_retry_after(monkeypatch):
+    from app.api.v1 import markets
+    from app.services.sec_companyfacts import SecCompanyFactsError
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_fundamentals",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            SecCompanyFactsError("SEC rate limit exceeded.", retry_after_s=60)
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/valuation")
+
+    assert response.status_code == 502
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["detail"] == "SEC rate limit exceeded."
+
+
+def test_market_valuation_endpoint_returns_stale_quote_response(monkeypatch):
+    from app.api.v1 import markets
+
+    payload = _valuation_response_payload()
+    payload["data_quality"]["stale"] = True
+    payload["warnings"] = [
+        "Quote refresh failed; serving stale cached data: Quote provider is busy."
+    ]
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: payload,
+    )
+
+    response = client.get("/api/v1/markets/SGX/S63/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["data_quality"]["stale"] is True
+    assert response.json()["warnings"] == payload["warnings"]
+
+
 def test_market_valuation_endpoint_returns_unreliable_as_200(monkeypatch):
     from app.api.v1 import markets
 

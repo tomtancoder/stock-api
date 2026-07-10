@@ -9,9 +9,16 @@ from app.core.config import Settings
 
 
 class FakeResponse:
-    def __init__(self, payload: Any, *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: Any,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -945,6 +952,35 @@ def test_provider_http_failure_is_wrapped_as_typed_error(
 
     assert exc_info.value.status_code == 502
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_sec_rate_limit_preserves_valid_retry_after_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    sec_companyfacts._clear_cache()
+    monkeypatch.setattr(
+        sec_companyfacts,
+        "get_settings",
+        lambda: Settings(sec_user_agent="stock-api test@example.com"),
+    )
+    install_http(
+        monkeypatch,
+        {
+            sec_companyfacts.TICKERS_URL: FakeResponse(
+                {},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+        },
+    )
+
+    with pytest.raises(sec_companyfacts.SecCompanyFactsError) as exc_info:
+        sec_companyfacts.resolve_cik("AAPL")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.retry_after_s == 60
 
 
 def test_reit_facts_keep_units_latest_amendments_and_field_provenance(

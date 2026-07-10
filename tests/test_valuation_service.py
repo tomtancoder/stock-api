@@ -811,6 +811,62 @@ def test_quote_provider_failure_preserves_retry_hint_in_service_error(
     assert exc_info.value.reasons == ["Quote provider is busy."]
 
 
+def test_expired_quote_refresh_failure_serves_stale_quote_until_stale_ttl(
+    monkeypatch, fake_clock
+):
+    fundamentals = _fundamentals()
+    quote_calls = 0
+
+    _install_success(
+        monkeypatch,
+        envelope=_envelope(fundamentals),
+        quote=_quote(currency="USD", price=6.0),
+    )
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            valuation_quote_ttl_seconds=300,
+            valuation_stale_ttl_seconds=900,
+        ),
+    )
+
+    def quote(exchange: str, symbol: str) -> dict[str, object]:
+        nonlocal quote_calls
+        quote_calls += 1
+        if quote_calls == 1:
+            return _quote(currency="USD", price=6.0)
+        raise TradingViewProviderError(
+            "Quote provider is busy.", status_code=503
+        )
+
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider, "get_quote", quote
+    )
+
+    fresh = valuation_service.get_valuation("NASDAQ", "ACME")
+    fake_clock.monotonic[0] = 300.0
+    fake_clock.wall[0] = NOW + timedelta(seconds=300)
+    stale = valuation_service.get_valuation("NASDAQ", "ACME")
+
+    assert fresh.data_quality.stale is False
+    assert stale.current_price == 6.0
+    assert stale.data_quality.stale is True
+    assert (
+        "Quote refresh failed; serving stale cached data: "
+        "Quote provider is busy."
+    ) in stale.warnings
+    assert quote_calls == 2
+
+    fake_clock.monotonic[0] = 900.0
+    fake_clock.wall[0] = NOW + timedelta(seconds=900)
+    with pytest.raises(valuation_service.ValuationServiceError) as exc_info:
+        valuation_service.get_valuation("NASDAQ", "ACME")
+
+    assert exc_info.value.detail == "Quote provider is busy."
+    assert quote_calls == 3
+
+
 def test_model_and_quote_caches_expire_independently(monkeypatch, fake_clock):
     fundamentals = _fundamentals()
     envelope = _envelope(fundamentals, fresh_until=NOW + timedelta(hours=24))

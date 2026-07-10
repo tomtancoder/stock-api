@@ -1278,12 +1278,14 @@ def test_sec_provider_failure_without_stale_entry_remains_typed(monkeypatch):
         valuation_fundamentals,
         "fetch_sec_fundamentals",
         lambda exchange, symbol: (_ for _ in ()).throw(
-            SecCompanyFactsError("SEC unavailable")
+            SecCompanyFactsError("SEC unavailable", retry_after_s=60)
         ),
     )
 
-    with pytest.raises(SecCompanyFactsError, match="SEC unavailable"):
+    with pytest.raises(SecCompanyFactsError, match="SEC unavailable") as exc_info:
         valuation_fundamentals.get_fundamentals("NASDAQ", "ACME")
+
+    assert exc_info.value.retry_after_s == 60
 
 
 def test_fundamentals_envelope_is_immutable(monkeypatch):

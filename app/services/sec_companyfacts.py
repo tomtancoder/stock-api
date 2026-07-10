@@ -29,10 +29,22 @@ SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 class SecCompanyFactsError(RuntimeError):
     """Raised when SEC company facts cannot be retrieved or normalized."""
 
-    def __init__(self, detail: str, *, status_code: int = 502) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        status_code: int = 502,
+        retry_after_s: int | None = None,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
+        self.retry_after_s = retry_after_s
+        self.headers = (
+            {"Retry-After": str(retry_after_s)}
+            if retry_after_s is not None
+            else None
+        )
 
 
 _TICKER_CACHE: tuple[float, dict[str, str]] | None = None
@@ -789,12 +801,29 @@ def _request_json(url: str) -> Any:
             headers={"User-Agent": user_agent},
         ) as client:
             response = client.get(url)
+            if response.status_code == 429:
+                raise SecCompanyFactsError(
+                    f"SEC request rate limited for {url}",
+                    retry_after_s=_retry_after_s(
+                        getattr(response, "headers", {}).get("Retry-After")
+                    ),
+                )
             response.raise_for_status()
             return response.json()
     except SecCompanyFactsError:
         raise
     except Exception as exc:  # noqa: BLE001 - normalize provider failures.
         raise SecCompanyFactsError(f"SEC request failed for {url}: {exc}") from exc
+
+
+def _retry_after_s(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _normalize_ticker_mapping(payload: Any) -> dict[str, str]:
