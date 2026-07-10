@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -802,11 +803,15 @@ def _request_json(url: str) -> Any:
         ) as client:
             response = client.get(url)
             if response.status_code == 429:
+                headers = getattr(response, "headers", None)
+                retry_after = (
+                    headers.get("Retry-After")
+                    if isinstance(headers, Mapping)
+                    else None
+                )
                 raise SecCompanyFactsError(
                     f"SEC request rate limited for {url}",
-                    retry_after_s=_retry_after_s(
-                        getattr(response, "headers", {}).get("Retry-After")
-                    ),
+                    retry_after_s=_retry_after_s(retry_after),
                 )
             response.raise_for_status()
             return response.json()
@@ -817,13 +822,23 @@ def _request_json(url: str) -> Any:
 
 
 def _retry_after_s(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
+    if not isinstance(value, str):
         return None
+    candidate = value.strip()
+    if re.fullmatch(r"\d+", candidate):
+        return int(candidate)
     try:
-        seconds = int(float(value))
-    except (TypeError, ValueError):
+        retry_at = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    return seconds if seconds > 0 else None
+    if retry_at.tzinfo is None:
+        return None
+    delay = (retry_at.astimezone(timezone.utc) - _utc_now()).total_seconds()
+    return max(0, math.ceil(delay))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _normalize_ticker_mapping(payload: Any) -> dict[str, str]:

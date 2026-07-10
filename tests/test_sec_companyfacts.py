@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from threading import Event, Thread
 from typing import Any
 
@@ -981,6 +983,77 @@ def test_sec_rate_limit_preserves_valid_retry_after_metadata(
 
     assert exc_info.value.status_code == 502
     assert exc_info.value.retry_after_s == 60
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0", 0),
+        ("60", 60),
+        ("60.5", None),
+        ("later", None),
+        ("-1", None),
+    ],
+)
+def test_retry_after_parses_only_exact_non_negative_delay_seconds(
+    value: str, expected: int | None
+) -> None:
+    from app.services import sec_companyfacts
+
+    assert sec_companyfacts._retry_after_s(value) == expected
+
+
+def test_retry_after_parses_future_http_date_with_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    now = datetime(2026, 7, 11, 9, 0, 0, 500_000, tzinfo=timezone.utc)
+    monkeypatch.setattr(sec_companyfacts, "_utc_now", lambda: now)
+    retry_at = format_datetime(now + timedelta(seconds=60), usegmt=True)
+
+    assert sec_companyfacts._retry_after_s(retry_at) == 60
+
+
+def test_retry_after_returns_zero_for_expired_http_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    now = datetime(2026, 7, 11, 9, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(sec_companyfacts, "_utc_now", lambda: now)
+    retry_at = format_datetime(now - timedelta(seconds=60), usegmt=True)
+
+    assert sec_companyfacts._retry_after_s(retry_at) == 0
+
+
+def test_sec_rate_limit_preserves_zero_retry_after_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    sec_companyfacts._clear_cache()
+    monkeypatch.setattr(
+        sec_companyfacts,
+        "get_settings",
+        lambda: Settings(sec_user_agent="stock-api test@example.com"),
+    )
+    install_http(
+        monkeypatch,
+        {
+            sec_companyfacts.TICKERS_URL: FakeResponse(
+                {},
+                status_code=429,
+                headers={"Retry-After": "0"},
+            )
+        },
+    )
+
+    with pytest.raises(sec_companyfacts.SecCompanyFactsError) as exc_info:
+        sec_companyfacts.resolve_cik("AAPL")
+
+    assert exc_info.value.retry_after_s == 0
+    assert exc_info.value.headers == {"Retry-After": "0"}
 
 
 def test_reit_facts_keep_units_latest_amendments_and_field_provenance(
