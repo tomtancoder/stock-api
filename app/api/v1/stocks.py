@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Path, Query
 
 from app.core.config import get_settings
-from app.schemas import QuoteResponse, TradeScoreResponse
+from app.schemas import QuoteResponse
 from app.services import tradingview_provider as provider
 from app.services.tradingview_provider import TradingViewProviderError
 
@@ -24,7 +24,7 @@ def fundamentals(symbol: str = Path(..., min_length=1, max_length=64)) -> None:
         status_code=501,
         detail=(
             "Fundamentals are not supported by the TradingView MCP provider. "
-            "Use /api/v1/markets/{exchange}/{symbol}/analysis or /score for trading signals."
+            "Use /api/v1/markets/{exchange}/{symbol}/analysis or /technical for trading signals."
         ),
     )
 
@@ -36,24 +36,25 @@ def technicals(
     timeframe: str | None = Query(default=None, min_length=1, max_length=16),
 ) -> dict[str, Any]:
     return _provider_response(
-        provider.get_analysis,
+        provider.get_technical_analysis,
         exchange or get_settings().default_exchange,
         symbol,
         timeframe or get_settings().default_timeframe,
     )
 
 
-@router.post("/{symbol}/valuation", response_model=TradeScoreResponse)
+@router.post("/{symbol}/valuation")
 def valuation(
     symbol: str = Path(..., min_length=1, max_length=64),
     exchange: str | None = Query(default=None, min_length=1, max_length=32),
     timeframe: str | None = Query(default=None, min_length=1, max_length=16),
-) -> dict[str, Any]:
-    return _provider_response(
-        provider.get_trade_score,
-        exchange or get_settings().default_exchange,
-        symbol,
-        timeframe or get_settings().default_timeframe,
+) -> None:
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Valuation is not supported by the TradingView MCP provider. "
+            "Use /api/v1/markets/{exchange}/{symbol}/technical for TradingView technical analysis."
+        ),
     )
 
 
@@ -61,4 +62,8 @@ def _provider_response(func, *args):
     try:
         return func(*args)
     except TradingViewProviderError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=str(exc),
+            headers=exc.headers,
+        ) from exc

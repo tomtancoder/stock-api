@@ -8,7 +8,7 @@ from app.api.v1.stocks import router as stocks_router
 app = FastAPI(
     title="Trading Intelligence API",
     version="0.1.0",
-    description="Market quotes, technical analysis, trade scores, screeners, sentiment, and backtests powered by TradingView MCP.",
+    description="Market quotes, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.",
 )
 
 

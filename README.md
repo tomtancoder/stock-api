@@ -1,6 +1,6 @@
 # Trading Intelligence API
 
-FastAPI API for market quotes, technical analysis, trade scores, screeners, sentiment, news, and backtests powered by TradingView MCP.
+FastAPI API for market quotes, yfinance-based analysis, TradingView MCP technical analysis and screeners, sentiment, news, and backtests.
 
 For external application integration details, endpoint samples, response shapes, and client examples, see [API_DOCUMENTATION.md](API_DOCUMENTATION.md).
 
@@ -25,7 +25,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /health`
 - `GET /api/v1/markets/{exchange}/{symbol}/quote`
 - `GET /api/v1/markets/{exchange}/{symbol}/analysis?timeframe=1D`
-- `GET /api/v1/markets/{exchange}/{symbol}/score?timeframe=1D`
+- `GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D`
 - `GET /api/v1/markets/{exchange}/gainers`
 - `GET /api/v1/markets/{exchange}/losers`
 - `GET /api/v1/markets/{exchange}/bollinger-scan`
@@ -42,35 +42,34 @@ Legacy stock routes remain as compatibility aliases:
 - `GET /api/v1/stocks/{symbol}/technicals`
 - `POST /api/v1/stocks/{symbol}/valuation`
 
-`GET /api/v1/stocks/{symbol}/fundamentals` returns `501` because TradingView MCP does not provide the cash flow, balance sheet, and income statement fields that powered the previous DCF model.
+`GET /api/v1/stocks/{symbol}/fundamentals` and `POST /api/v1/stocks/{symbol}/valuation` return `501`; fundamentals and valuation are not part of the current API surface.
+
+Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
+Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
+Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available.
 
 ## Markets
 
-Exchange codes are passed through to TradingView MCP. For Singapore, use `SGX`:
+Exchange codes are mapped to Yahoo-compatible symbols where needed. For Singapore, use `SGX`:
 
 - Quote: `GET /api/v1/markets/SGX/D05/quote`
 - Analysis: `GET /api/v1/markets/SGX/D05/analysis?timeframe=1D`
-- Score: `GET /api/v1/markets/SGX/D05/score?timeframe=1D`
+- Technical: `GET /api/v1/markets/SGX/D05/technical?timeframe=1D`
 
-The provider also accepts Yahoo-style Singapore symbols such as `D05.SI` for analysis and score routes, and normalizes them to TradingView's `SGX:D05` format internally. Market-wide SGX scanners depend on the symbol universe available from the TradingView MCP package.
+The provider also accepts Yahoo-style Singapore symbols such as `D05.SI` for analysis and technical routes, and returns public symbols such as `SGX:D05`. Market-wide SGX scanners still depend on the symbol universe available from the TradingView MCP package.
 
 For spot gold, use `TVC` with `XAUUSD`:
 
 - Quote: `GET /api/v1/markets/TVC/XAUUSD/quote`
 - Analysis: `GET /api/v1/markets/TVC/XAUUSD/analysis?timeframe=1D`
-- Score: `GET /api/v1/markets/TVC/XAUUSD/score?timeframe=1D`
+- Technical: `GET /api/v1/markets/TVC/XAUUSD/technical?timeframe=1D`
 - Backtest: `POST /api/v1/backtests/TVC/XAUUSD`
 
-TradingView analysis resolves this to `TVC:GOLD`; Yahoo-backed quote and backtest data resolves to `GC=F`.
+yfinance-backed quote, analysis, and backtest data resolves this to `GC=F`. TradingView MCP technical analysis resolves `XAUUSD` to TradingView's `TVC:GOLD` feed.
 
-## Trade Scores
+## Technical Analysis
 
-`/score` and the legacy `/valuation` route return a `TradeScoreResponse`, not an intrinsic value:
-
-- `score` is 0-100.
-- `score_source` is `stock_score` when TradingView MCP provides one.
-- Otherwise, `score_source` is `technical_rating`, mapped from TradingView's `-3..3` technical rating into `0..100`.
-- The response includes signal, grade, trend state, price data, trade setup, risk/reward, key indicators, and warnings.
+`/technical` returns the TradingView MCP technical analysis payload for one symbol. Client applications should treat indicator objects as provider-shaped dictionaries and read only the fields they need.
 
 ## Configuration
 
@@ -113,7 +112,7 @@ Run the mocked test suite:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Run optional live TradingView MCP checks only when explicitly enabled:
+Run optional live provider checks only when explicitly enabled:
 
 ```powershell
 $env:RUN_LIVE_TRADINGVIEW_TESTS = "1"

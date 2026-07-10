@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Path, Query
 
 from app.core.config import get_settings
-from app.schemas import QuoteResponse, TradeScoreResponse
+from app.schemas import QuoteResponse
 from app.services import tradingview_provider as provider
 from app.services.tradingview_provider import TradingViewProviderError
 
@@ -32,14 +32,14 @@ def analysis(
     )
 
 
-@router.get("/{exchange}/{symbol}/score", response_model=TradeScoreResponse)
-def score(
+@router.get("/{exchange}/{symbol}/technical")
+def technical(
     exchange: str = Path(..., min_length=1, max_length=32),
     symbol: str = Path(..., min_length=1, max_length=64),
     timeframe: str | None = Query(default=None, min_length=1, max_length=16),
 ) -> dict[str, Any]:
     return _provider_response(
-        provider.get_trade_score,
+        provider.get_technical_analysis,
         exchange,
         symbol,
         timeframe or get_settings().default_timeframe,
@@ -110,5 +110,8 @@ def _provider_response(func, *args):
     try:
         return func(*args)
     except TradingViewProviderError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=str(exc),
+            headers=exc.headers,
+        ) from exc

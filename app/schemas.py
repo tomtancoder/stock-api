@@ -1,6 +1,4 @@
-from typing import Any
-
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class QuoteResponse(BaseModel):
@@ -12,26 +10,10 @@ class QuoteResponse(BaseModel):
     change_percent: float | None = None
     currency: str | None = None
     market_state: str | None = None
+    fifty_two_week_high: float | None = None
+    fifty_two_week_low: float | None = None
     source: str | None = None
     timestamp: str | None = None
-    warnings: list[str] = Field(default_factory=list)
-
-
-class TradeScoreResponse(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    symbol: str
-    exchange: str
-    timeframe: str
-    score: float | None = None
-    score_source: str
-    signal: str | None = None
-    grade: str | None = None
-    trend_state: str | None = None
-    price_data: dict[str, Any] = Field(default_factory=dict)
-    trade_setup: dict[str, Any] | None = None
-    risk_reward: float | None = None
-    key_indicators: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 

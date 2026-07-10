@@ -38,6 +38,8 @@ def test_market_quote_endpoint_uses_tradingview_provider(monkeypatch):
             "change_percent": 1.1626,
             "currency": "USD",
             "market_state": "REGULAR",
+            "fifty_two_week_high": 555.45,
+            "fifty_two_week_low": 349.2,
             "source": "Yahoo Finance",
             "timestamp": "2026-07-09T00:00:00+00:00",
             "warnings": [],
@@ -53,6 +55,8 @@ def test_market_quote_endpoint_uses_tradingview_provider(monkeypatch):
     assert payload["exchange"] == "NASDAQ"
     assert payload["price"] == 428.11
     assert payload["change_percent"] == 1.1626
+    assert payload["fifty_two_week_high"] == 555.45
+    assert payload["fifty_two_week_low"] == 349.2
 
 
 def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
@@ -80,36 +84,65 @@ def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
     assert payload["market_sentiment"]["buy_sell_signal"] == "BUY"
 
 
-def test_market_score_endpoint_returns_trade_score(monkeypatch):
+def test_market_analysis_retryable_error_returns_retry_after_header(monkeypatch):
+    from app.api.v1 import markets
+    from app.services.tradingview_provider import TradingViewProviderError
+
+    monkeypatch.setattr(
+        markets.provider,
+        "get_analysis",
+        lambda exchange, symbol, timeframe: (_ for _ in ()).throw(
+            TradingViewProviderError(
+                "TradingView scanner is temporarily unavailable.",
+                status_code=503,
+                retry_after_s=60,
+            )
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/analysis")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["detail"] == "TradingView scanner is temporarily unavailable."
+
+
+def test_market_technical_endpoint_returns_tradingview_mcp_analysis(monkeypatch):
     from app.api.v1 import markets
 
-    def fake_score(exchange: str, symbol: str, timeframe: str):
+    def fake_technical(exchange: str, symbol: str, timeframe: str):
         assert (exchange, symbol, timeframe) == ("NASDAQ", "TSLA", "1D")
         return {
             "symbol": "NASDAQ:TSLA",
             "exchange": "NASDAQ",
             "timeframe": "1D",
-            "score": 87.0,
-            "score_source": "stock_score",
-            "signal": "BUY",
+            "source": "tradingview_mcp",
+            "timestamp": "real-time",
+            "price_data": {"current_price": 428.11},
+            "market_sentiment": {"overall_rating": 2, "buy_sell_signal": "BUY"},
+            "stock_score": 87,
             "grade": "A",
             "trend_state": "bullish",
-            "price_data": {"current_price": 428.11},
             "trade_setup": {"risk_reward": 2.4},
-            "risk_reward": 2.4,
-            "key_indicators": {"rsi": {"value": 61.2}},
-            "warnings": [],
+            "rsi": {"value": 61.2},
         }
 
-    monkeypatch.setattr(markets.provider, "get_trade_score", fake_score)
+    monkeypatch.setattr(markets.provider, "get_technical_analysis", fake_technical)
 
-    response = client.get("/api/v1/markets/NASDAQ/TSLA/score")
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/technical")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["score"] == 87.0
-    assert payload["score_source"] == "stock_score"
-    assert payload["risk_reward"] == 2.4
+    assert payload["source"] == "tradingview_mcp"
+    assert payload["stock_score"] == 87
+    assert payload["market_sentiment"]["buy_sell_signal"] == "BUY"
+    assert payload["trade_setup"]["risk_reward"] == 2.4
+
+
+def test_market_score_endpoint_is_removed():
+    response = client.get("/api/v1/markets/NASDAQ/TSLA/score")
+
+    assert response.status_code == 404
 
 
 def test_market_sgx_endpoints_accept_singapore_symbols(monkeypatch):
@@ -294,41 +327,24 @@ def test_stock_routes_remain_compatibility_aliases(monkeypatch):
     )
     monkeypatch.setattr(
         stocks.provider,
-        "get_analysis",
+        "get_technical_analysis",
         lambda exchange, symbol, timeframe: {
             "symbol": f"{exchange}:{symbol}",
             "timeframe": timeframe,
+            "source": "tradingview_mcp",
             "market_sentiment": {"buy_sell_signal": "BUY"},
-        },
-    )
-    monkeypatch.setattr(
-        stocks.provider,
-        "get_trade_score",
-        lambda exchange, symbol, timeframe: {
-            "symbol": f"{exchange}:{symbol}",
-            "exchange": exchange,
-            "timeframe": timeframe,
-            "score": 83.33,
-            "score_source": "technical_rating",
-            "signal": "BUY",
-            "grade": None,
-            "trend_state": None,
-            "price_data": {},
-            "trade_setup": None,
-            "risk_reward": None,
-            "key_indicators": {},
-            "warnings": [],
         },
     )
 
     quote = client.get("/api/v1/stocks/TSLA/quote?exchange=NYSE").json()
     technicals = client.get("/api/v1/stocks/TSLA/technicals?timeframe=4h").json()
-    valuation = client.post("/api/v1/stocks/TSLA/valuation").json()
+    valuation = client.post("/api/v1/stocks/TSLA/valuation")
     fundamentals = client.get("/api/v1/stocks/TSLA/fundamentals")
 
     assert quote["exchange"] == "NYSE"
     assert technicals["timeframe"] == "4h"
-    assert valuation["score"] == 83.33
-    assert valuation["score_source"] == "technical_rating"
+    assert technicals["source"] == "tradingview_mcp"
+    assert valuation.status_code == 501
+    assert "Valuation is not supported" in valuation.json()["detail"]
     assert fundamentals.status_code == 501
     assert "Fundamentals are not supported" in fundamentals.json()["detail"]

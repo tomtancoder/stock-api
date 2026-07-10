@@ -3,11 +3,22 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from app.services.yfinance_analysis import get_analysis as get_yfinance_analysis
+
 
 class TradingViewProviderError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 502,
+        retry_after_s: int | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_s = retry_after_s
+        self.headers = (
+            {"Retry-After": str(retry_after_s)} if retry_after_s is not None else None
+        )
 
 
 def _register_market_overrides() -> None:
@@ -93,6 +104,8 @@ def get_quote(exchange: str, symbol: str) -> dict[str, Any]:
         "change_percent": payload.get("change_pct"),
         "currency": payload.get("currency"),
         "market_state": payload.get("market_state"),
+        "fifty_two_week_high": payload.get("52w_high"),
+        "fifty_two_week_low": payload.get("52w_low"),
         "source": payload.get("source"),
         "timestamp": payload.get("timestamp"),
         "warnings": [],
@@ -101,54 +114,21 @@ def get_quote(exchange: str, symbol: str) -> dict[str, Any]:
 
 def get_analysis(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
     normalized_timeframe = _normalize_timeframe(timeframe)
-    payload = analyze_coin(
-        symbol=_analysis_symbol(exchange, symbol),
-        exchange=_provider_exchange(exchange),
-        timeframe=_provider_timeframe(timeframe),
-    )
+    payload = get_yfinance_analysis(_normalize_exchange(exchange), symbol, normalized_timeframe)
     _raise_if_error(payload)
     return _with_public_timeframe(payload, normalized_timeframe)
 
 
-def get_trade_score(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
-    analysis = get_analysis(exchange, symbol, timeframe)
-    market_sentiment = _as_dict(analysis.get("market_sentiment"))
-    trade_setup = _as_optional_dict(analysis.get("trade_setup"))
-    warnings: list[str] = []
-
-    stock_score = _to_float(analysis.get("stock_score"))
-    if stock_score is not None:
-        score = _clamp(round(stock_score, 2), 0, 100)
-        score_source = "stock_score"
-    else:
-        rating = _to_float(market_sentiment.get("overall_rating"))
-        if rating is None:
-            score = None
-            score_source = "technical_rating_unavailable"
-            warnings.append("TradingView technical rating is missing; score cannot be calculated.")
-        else:
-            score = _clamp(round(((rating + 3) / 6) * 100, 2), 0, 100)
-            score_source = "technical_rating"
-
-    return {
-        "symbol": analysis.get("symbol") or f"{_normalize_exchange(exchange)}:{_normalize_symbol(symbol)}",
-        "exchange": _normalize_exchange(exchange),
-        "timeframe": _normalize_timeframe(timeframe),
-        "score": score,
-        "score_source": score_source,
-        "signal": market_sentiment.get("buy_sell_signal"),
-        "grade": analysis.get("grade"),
-        "trend_state": analysis.get("trend_state"),
-        "price_data": _as_dict(analysis.get("price_data")),
-        "trade_setup": trade_setup,
-        "risk_reward": _to_float(trade_setup.get("risk_reward")) if trade_setup else None,
-        "key_indicators": {
-            key: analysis[key]
-            for key in ("rsi", "macd", "ema", "bollinger_bands", "atr")
-            if key in analysis
-        },
-        "warnings": warnings,
-    }
+def get_technical_analysis(exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
+    normalized_timeframe = _normalize_timeframe(timeframe)
+    payload = analyze_coin(
+        _analysis_symbol(exchange, symbol),
+        _normalize_exchange(exchange),
+        normalized_timeframe,
+    )
+    _raise_if_error(payload)
+    response = _with_public_timeframe(_plain_dict(payload), normalized_timeframe)
+    return {**response, "source": "tradingview_mcp"}
 
 
 def get_gainers(exchange: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
@@ -273,10 +253,12 @@ def _raise_if_error(payload: Any) -> None:
         message = str(error.get("message") or error.get("code") or "TradingView provider error.")
         code = str(error.get("code") or "")
         retryable = bool(error.get("retryable", False))
+        retry_after_s = _retry_after_s(error.get("retry_after_s"))
     else:
         message = str(error)
         code = ""
         retryable = False
+        retry_after_s = None
 
     if code == "SYMBOL_NOT_FOUND" or "No data found" in message:
         status_code = 404
@@ -284,7 +266,11 @@ def _raise_if_error(payload: Any) -> None:
         status_code = 503
     else:
         status_code = 502
-    raise TradingViewProviderError(message, status_code=status_code)
+    raise TradingViewProviderError(
+        message,
+        status_code=status_code,
+        retry_after_s=retry_after_s if status_code == 503 else None,
+    )
 
 
 def _row_dicts(rows: list[Any]) -> list[dict[str, Any]]:
@@ -372,22 +358,11 @@ def _provider_timeframe(timeframe: str) -> str:
     }.get(normalized_timeframe, normalized_timeframe)
 
 
-def _as_dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _as_optional_dict(value: Any) -> dict[str, Any] | None:
-    return value if isinstance(value, dict) else None
-
-
-def _to_float(value: Any) -> float | None:
+def _retry_after_s(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        seconds = int(float(value))
     except (TypeError, ValueError):
         return None
-
-
-def _clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(maximum, value))
+    return seconds if seconds > 0 else None

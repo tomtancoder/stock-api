@@ -1,6 +1,6 @@
 # Trading Intelligence API Documentation
 
-This document is for client applications that want to consume the Trading Intelligence API. The API provides quotes, technical analysis, trade scores, market screeners, backtests, sentiment, and news using TradingView MCP-backed services.
+This document is for client applications that want to consume the Trading Intelligence API. The API provides quotes, yfinance-based analysis, TradingView MCP technical analysis and market screeners, backtests, sentiment, and news.
 
 ## Base URL
 
@@ -67,7 +67,7 @@ TVC / XAUUSD
 BINANCE / BTCUSDT
 ```
 
-The exchange is passed through to the provider layer as a TradingView-style market code. Market support depends on TradingView MCP and the underlying data source.
+The exchange is passed through to the provider layer as a market or venue code. Analysis maps symbols to Yahoo-compatible symbols; TradingView MCP technical analysis maps symbols to TradingView-compatible symbols; market-wide screeners still depend on TradingView MCP support.
 
 ### Special Symbol Handling
 
@@ -76,26 +76,26 @@ Singapore stocks:
 ```text
 GET /api/v1/markets/SGX/D05/quote
 GET /api/v1/markets/SGX/D05/analysis?timeframe=1D
-GET /api/v1/markets/SGX/D05/score?timeframe=1D
+GET /api/v1/markets/SGX/D05/technical?timeframe=1D
 POST /api/v1/backtests/SGX/D05
 ```
 
-Internally, Singapore quote and backtest data uses Yahoo-style `.SI` symbols such as `D05.SI`. TradingView analysis uses `SGX:D05`.
+Internally, Singapore quote, analysis, and backtest data uses Yahoo-style `.SI` symbols such as `D05.SI`. TradingView MCP technical analysis strips that suffix and returns TradingView symbols such as `SGX:D05`.
 
 Spot gold:
 
 ```text
 GET /api/v1/markets/TVC/XAUUSD/quote
 GET /api/v1/markets/TVC/XAUUSD/analysis?timeframe=1D
-GET /api/v1/markets/TVC/XAUUSD/score?timeframe=1D
+GET /api/v1/markets/TVC/XAUUSD/technical?timeframe=1D
 POST /api/v1/backtests/TVC/XAUUSD
 ```
 
-Internally, TradingView analysis resolves `XAUUSD` to `TVC:GOLD`. Yahoo-backed quote and backtest data resolves to `GC=F`.
+Internally, yfinance-backed quote, analysis, and backtest data resolves `XAUUSD` to `GC=F`. TradingView MCP technical analysis resolves `XAUUSD` to TradingView's `TVC:GOLD` feed.
 
 ### Timeframes
 
-Use `timeframe` for analysis, scoring, and screeners.
+Use `timeframe` for analysis, technical analysis, and screeners.
 
 Supported values:
 
@@ -117,6 +117,8 @@ Recommended defaults:
 1h  intraday view
 1W  longer trend view
 ```
+
+For yfinance-backed analysis, `4h` is built by fetching `1h` candles and resampling them into four-hour candles.
 
 ### Backtest Intervals
 
@@ -162,8 +164,8 @@ triple_ema
 | `GET` | `/` | API metadata and docs link |
 | `GET` | `/health` | Health check |
 | `GET` | `/api/v1/markets/{exchange}/{symbol}/quote` | Latest quote |
-| `GET` | `/api/v1/markets/{exchange}/{symbol}/analysis` | Technical analysis and indicators |
-| `GET` | `/api/v1/markets/{exchange}/{symbol}/score` | 0-100 trade score |
+| `GET` | `/api/v1/markets/{exchange}/{symbol}/analysis` | yfinance analysis and indicators |
+| `GET` | `/api/v1/markets/{exchange}/{symbol}/technical` | TradingView MCP technical analysis |
 | `GET` | `/api/v1/markets/{exchange}/gainers` | Market gainers |
 | `GET` | `/api/v1/markets/{exchange}/losers` | Market losers |
 | `GET` | `/api/v1/markets/{exchange}/bollinger-scan` | Bollinger width scan |
@@ -239,13 +241,15 @@ Example response:
   "change_percent": 1.16,
   "currency": "USD",
   "market_state": "REGULAR",
+  "fifty_two_week_high": 555.45,
+  "fifty_two_week_low": 349.2,
   "source": "Yahoo Finance",
   "timestamp": "2026-07-09T00:00:00+00:00",
   "warnings": []
 }
 ```
 
-### Technical Analysis
+### Analysis
 
 ```http
 GET /api/v1/markets/{exchange}/{symbol}/analysis?timeframe=1D
@@ -277,8 +281,21 @@ Example response shape:
     "high": 70.3,
     "low": 69.2,
     "close": 70.02,
+    "previous_close": 69.1,
     "change_percent": 1.33,
-    "volume": 1234567
+    "volume": 1234567,
+    "market_cap": 102300000000,
+    "fifty_two_week_high": 76.8,
+    "fifty_two_week_low": 58.4,
+    "yahoo_symbol": "D05.SI"
+  },
+  "valuation_metrics": {
+    "trailing_pe": 12.48,
+    "forward_pe": 11.92,
+    "diluted_eps_ttm": 5.61,
+    "forward_eps": 5.87,
+    "primary_pe": "trailing",
+    "pe_calculated": false
   },
   "rsi": {},
   "macd": {},
@@ -293,15 +310,17 @@ Example response shape:
 }
 ```
 
-The analysis response can include many technical indicator objects. Client applications should treat indicator objects as provider-shaped dictionaries and only read fields they need.
+The analysis response is calculated locally from yfinance OHLCV history and can include many technical indicator objects. `price_data.market_cap`, `price_data.fifty_two_week_high`, and `price_data.fifty_two_week_low` come from yfinance fast quote metadata when available; market cap falls back to shares times latest price when Yahoo omits the direct value.
 
-### Trade Score
+`valuation_metrics.trailing_pe` is the primary P/E. The API uses Yahoo's finite, positive trailing P/E when available and otherwise calculates current price divided by finite, positive diluted trailing EPS. `valuation_metrics.forward_pe` remains a separately labeled estimate and is calculated from forward EPS only when Yahoo omits the direct ratio. Zero, negative, missing, NaN, or infinite P/E and EPS inputs produce `null`; forward P/E is never substituted for trailing P/E. Fundamental metadata is cached using `STOCK_API_CACHE_TTL_SECONDS` and is best-effort, so a metadata failure leaves nullable valuation fields without failing the rest of `/analysis`.
+
+### TradingView MCP Technical Analysis
 
 ```http
-GET /api/v1/markets/{exchange}/{symbol}/score?timeframe=1D
+GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D
 ```
 
-The score endpoint converts TradingView analysis into a normalized trade score.
+The technical endpoint returns TradingView MCP single-symbol technical analysis. It can include the provider's indicator objects, market sentiment, `stock_score` when available, and trade setup fields when available.
 
 Query parameters:
 
@@ -312,53 +331,43 @@ Query parameters:
 Example:
 
 ```bash
-curl "http://127.0.0.1:8000/api/v1/markets/TVC/XAUUSD/score?timeframe=1D"
+curl "http://127.0.0.1:8000/api/v1/markets/TVC/XAUUSD/technical?timeframe=1D"
 ```
 
-Example response:
+Example response shape:
 
 ```json
 {
   "symbol": "TVC:GOLD",
   "exchange": "TVC",
   "timeframe": "1D",
-  "score": 33.33,
-  "score_source": "technical_rating",
-  "signal": "NEUTRAL",
-  "grade": null,
-  "trend_state": null,
+  "timestamp": "real-time",
+  "source": "tradingview_mcp",
   "price_data": {
     "current_price": 4114.67
   },
-  "trade_setup": null,
-  "risk_reward": null,
-  "key_indicators": {
-    "rsi": {},
-    "macd": {},
-    "ema": {},
-    "bollinger_bands": {},
-    "atr": {}
+  "market_sentiment": {
+    "overall_rating": 0,
+    "buy_sell_signal": "NEUTRAL"
   },
-  "warnings": []
+  "rsi": {},
+  "macd": {},
+  "sma": {},
+  "ema": {},
+  "bollinger_bands": {},
+  "atr": {},
+  "volume_analysis": {},
+  "support_resistance": {},
+  "stock_score": 72,
+  "grade": "B",
+  "trend_state": "bullish",
+  "trade_setup": {
+    "risk_reward": 2.4
+  }
 }
 ```
 
-Score interpretation:
-
-| Score | Meaning |
-| --- | --- |
-| `0-39` | Weak or bearish setup |
-| `40-59` | Neutral or mixed setup |
-| `60-79` | Constructive setup |
-| `80-100` | Strong setup |
-
-`score_source` values:
-
-| Value | Meaning |
-| --- | --- |
-| `stock_score` | TradingView MCP provided a stock score |
-| `technical_rating` | Mapped from technical rating `-3..3` into `0..100` |
-| `technical_rating_unavailable` | Score could not be calculated |
+Client applications should treat indicator objects as provider-shaped dictionaries and read only the fields they need.
 
 ## Screeners
 
@@ -606,11 +615,11 @@ These routes are kept for compatibility with older clients. New applications sho
 | Method | Endpoint | Replacement |
 | --- | --- | --- |
 | `GET` | `/api/v1/stocks/{symbol}/quote?exchange=NASDAQ` | `/api/v1/markets/{exchange}/{symbol}/quote` |
-| `GET` | `/api/v1/stocks/{symbol}/technicals?exchange=NASDAQ&timeframe=1D` | `/api/v1/markets/{exchange}/{symbol}/analysis` |
-| `POST` | `/api/v1/stocks/{symbol}/valuation?exchange=NASDAQ&timeframe=1D` | `/api/v1/markets/{exchange}/{symbol}/score` |
+| `GET` | `/api/v1/stocks/{symbol}/technicals?exchange=NASDAQ&timeframe=1D` | `/api/v1/markets/{exchange}/{symbol}/technical` |
+| `POST` | `/api/v1/stocks/{symbol}/valuation?exchange=NASDAQ&timeframe=1D` | Not supported |
 | `GET` | `/api/v1/stocks/{symbol}/fundamentals` | Not supported |
 
-`/api/v1/stocks/{symbol}/fundamentals` returns HTTP `501` because the previous yFinance fundamentals and DCF model were removed.
+`/api/v1/stocks/{symbol}/fundamentals` and `/api/v1/stocks/{symbol}/valuation` return HTTP `501` because the previous yFinance fundamentals and DCF model were removed.
 
 ## Error Handling
 
@@ -677,9 +686,9 @@ async function apiPost(path, body) {
   return response.json();
 }
 
-export async function getTradeScore(exchange, symbol, timeframe = "1D") {
+export async function getTechnicalAnalysis(exchange, symbol, timeframe = "1D") {
   return apiGet(
-    `/api/v1/markets/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}/score?timeframe=${encodeURIComponent(timeframe)}`
+    `/api/v1/markets/${encodeURIComponent(exchange)}/${encodeURIComponent(symbol)}/technical?timeframe=${encodeURIComponent(timeframe)}`
   );
 }
 
@@ -718,13 +727,13 @@ def post_json(path: str, body: dict):
     return response.json()
 
 
-score = get_json("/api/v1/markets/SGX/D05/score?timeframe=1D")
+technical = get_json("/api/v1/markets/SGX/D05/technical?timeframe=1D")
 backtest = post_json(
     "/api/v1/backtests/TVC/XAUUSD",
     {"strategy": "rsi", "period": "1y", "interval": "1d"},
 )
 
-print(score["score"], score["signal"])
+print(technical["market_sentiment"]["buy_sell_signal"])
 print(backtest["symbol"], backtest["candles_analyzed"])
 ```
 
@@ -758,7 +767,6 @@ $env:MARKETAUX_API_TOKEN = "..."
 - Prefer `/api/v1/markets/...` for all new applications.
 - The legacy `/api/v1/stocks/...` endpoints may be removed in a future breaking version.
 - The API returns trading analysis, not investment advice.
-- `/score` is a trade-score concept, not intrinsic value or fair value.
 - Backtest results are historical simulations and are not predictive.
 - Market-wide screeners can be unavailable for markets where TradingView MCP does not provide a usable symbol universe.
 - Always URL-encode `exchange` and `symbol` values in client applications.

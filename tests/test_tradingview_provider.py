@@ -1,16 +1,20 @@
 import pytest
 
 
-def test_trade_score_uses_stock_score_when_available(monkeypatch):
+def test_technical_analysis_uses_tradingview_mcp_analyze_coin(monkeypatch):
     from app.services import tradingview_provider as provider
+
+    calls = []
 
     monkeypatch.setattr(
         provider,
         "analyze_coin",
-        lambda symbol, exchange, timeframe: {
+        lambda symbol, exchange, timeframe: calls.append((symbol, exchange, timeframe))
+        or {
             "symbol": "NASDAQ:TSLA",
-            "exchange": "nasdaq",
+            "exchange": "NASDAQ",
             "timeframe": "1D",
+            "timestamp": "real-time",
             "price_data": {"current_price": 428.11},
             "market_sentiment": {"overall_rating": 2, "buy_sell_signal": "BUY"},
             "stock_score": 87,
@@ -25,48 +29,49 @@ def test_trade_score_uses_stock_score_when_available(monkeypatch):
         },
     )
 
-    response = provider.get_trade_score("NASDAQ", "TSLA", "1D")
+    response = provider.get_technical_analysis("NASDAQ", "TSLA", "1d")
 
+    assert calls == [("TSLA", "NASDAQ", "1D")]
     assert response["symbol"] == "NASDAQ:TSLA"
-    assert response["score"] == 87.0
-    assert response["score_source"] == "stock_score"
-    assert response["signal"] == "BUY"
+    assert response["source"] == "tradingview_mcp"
+    assert response["market_sentiment"]["buy_sell_signal"] == "BUY"
+    assert response["stock_score"] == 87
     assert response["grade"] == "A"
-    assert response["risk_reward"] == 2.4
-    assert response["key_indicators"]["rsi"]["value"] == 61.2
+    assert response["trade_setup"]["risk_reward"] == 2.4
+    assert response["rsi"]["value"] == 61.2
 
 
-def test_trade_score_maps_technical_rating_when_stock_score_is_missing(monkeypatch):
+def test_technical_analysis_strips_sgx_yahoo_suffix(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    captured = {}
+
+    def fake_analyze_coin(symbol: str, exchange: str, timeframe: str):
+        captured["args"] = (symbol, exchange, timeframe)
+        return {
+            "symbol": "SGX:D05",
+            "exchange": "SGX",
+            "timeframe": "1D",
+            "market_sentiment": {"buy_sell_signal": "NEUTRAL"},
+        }
+
+    monkeypatch.setattr(provider, "analyze_coin", fake_analyze_coin)
+
+    response = provider.get_technical_analysis("SGX", "D05.SI", "1D")
+
+    assert captured["args"] == ("D05", "SGX", "1D")
+    assert response["symbol"] == "SGX:D05"
+    assert response["timeframe"] == "1D"
+    assert response["source"] == "tradingview_mcp"
+
+
+def test_technical_analysis_raises_provider_error_for_error_envelope(monkeypatch):
     from app.services import tradingview_provider as provider
 
     monkeypatch.setattr(
         provider,
         "analyze_coin",
-        lambda symbol, exchange, timeframe: {
-            "symbol": "BINANCE:BTCUSDT",
-            "exchange": "binance",
-            "timeframe": "4h",
-            "price_data": {"current_price": 112_000},
-            "market_sentiment": {"overall_rating": 2, "buy_sell_signal": "BUY"},
-            "rsi": {"value": 58.5},
-        },
-    )
-
-    response = provider.get_trade_score("BINANCE", "BTCUSDT", "4h")
-
-    assert response["score"] == 83.33
-    assert response["score_source"] == "technical_rating"
-    assert response["signal"] == "BUY"
-    assert response["warnings"] == []
-
-
-def test_trade_score_raises_provider_error_for_error_envelope(monkeypatch):
-    from app.services import tradingview_provider as provider
-
-    monkeypatch.setattr(
-        provider,
-        "analyze_coin",
-        lambda symbol, exchange, timeframe: {
+        lambda exchange, symbol, timeframe: {
             "error": {
                 "code": "SYMBOL_NOT_FOUND",
                 "message": "No data found for MISSING on NASDAQ.",
@@ -76,10 +81,33 @@ def test_trade_score_raises_provider_error_for_error_envelope(monkeypatch):
     )
 
     with pytest.raises(provider.TradingViewProviderError) as exc_info:
-        provider.get_trade_score("NASDAQ", "MISSING", "1D")
+        provider.get_technical_analysis("NASDAQ", "MISSING", "1D")
 
     assert exc_info.value.status_code == 404
     assert "No data found" in str(exc_info.value)
+
+
+def test_retryable_provider_error_preserves_retry_after_hint(monkeypatch):
+    from app.services import tradingview_provider as provider
+
+    monkeypatch.setattr(
+        provider,
+        "get_yfinance_analysis",
+        lambda exchange, symbol, timeframe: {
+            "error": {
+                "code": "UPSTREAM_ERROR",
+                "message": "yfinance is temporarily unavailable.",
+                "retryable": True,
+                "retry_after_s": 60,
+            }
+        },
+    )
+
+    with pytest.raises(provider.TradingViewProviderError) as exc_info:
+        provider.get_analysis("NASDAQ", "TSLA", "1D")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.retry_after_s == 60
 
 
 def test_quote_maps_yahoo_price_payload(monkeypatch):
@@ -97,6 +125,8 @@ def test_quote_maps_yahoo_price_payload(monkeypatch):
             "currency": "USD",
             "exchange": "NMS",
             "market_state": "REGULAR",
+            "52w_high": 555.45,
+            "52w_low": 349.2,
             "source": "Yahoo Finance",
             "timestamp": "2026-07-09T00:00:00+00:00",
         },
@@ -113,6 +143,8 @@ def test_quote_maps_yahoo_price_payload(monkeypatch):
         "change_percent": 1.16,
         "currency": "USD",
         "market_state": "REGULAR",
+        "fifty_two_week_high": 555.45,
+        "fifty_two_week_low": 349.2,
         "source": "Yahoo Finance",
         "timestamp": "2026-07-09T00:00:00+00:00",
         "warnings": [],
@@ -150,13 +182,13 @@ def test_sgx_quote_uses_yahoo_si_suffix(monkeypatch):
 def test_sgx_analysis_strips_yahoo_si_suffix(monkeypatch):
     from app.services import tradingview_provider as provider
 
-    def fake_analyze_coin(symbol: str, exchange: str, timeframe: str):
-        assert symbol == "D05"
-        assert exchange == "sgx"
-        assert timeframe == "1d"
+    def fake_yfinance_analysis(exchange: str, symbol: str, timeframe: str):
+        assert exchange == "SGX"
+        assert symbol == "D05.SI"
+        assert timeframe == "1D"
         return {"symbol": "SGX:D05", "exchange": "sgx", "timeframe": "1d"}
 
-    monkeypatch.setattr(provider, "analyze_coin", fake_analyze_coin)
+    monkeypatch.setattr(provider, "get_yfinance_analysis", fake_yfinance_analysis)
 
     response = provider.get_analysis("SGX", "D05.SI", "1D")
 

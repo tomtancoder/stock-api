@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.2.0",
     "tradingview-mcp-server @ git+https://github.com/atilaahmettaner/tradingview-mcp.git@546dc2a2e65b6ea8083a3c45a689f6e399a1df08",
     "uvicorn[standard]>=0.30.0",
+    "yfinance>=1.5.1",
 ]
 
 [project.optional-dependencies]
