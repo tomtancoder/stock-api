@@ -437,7 +437,10 @@ def _normalize_reit_metrics(
         and math.isfinite(float(value))
     }
     sources = dict(fundamentals.sources)
-    for metric in APPROVED_REIT_METRIC_KEYS:
+    metric_source_keys = (
+        set(APPROVED_REIT_METRIC_KEYS) | set(fundamentals.reit_metrics)
+    )
+    for metric in metric_source_keys:
         if metric not in reit_metrics:
             sources.pop(metric, None)
             continue
@@ -602,7 +605,16 @@ def _remaining_missing_fields(
     fundamentals: ValuationFundamentals,
 ) -> list[str]:
     remaining: list[str] = []
+    reit_missing_fields = {
+        "distribution_per_unit",
+        "diluted_shares",
+        "nav_per_unit",
+        "current_diluted_shares",
+    }
+    is_reit = _is_reit(fundamentals)
     for field in fundamentals.missing_fields:
+        if is_reit and field not in reit_missing_fields:
+            continue
         if field == "current_diluted_shares":
             if fundamentals.current_diluted_shares is None:
                 remaining.append(field)

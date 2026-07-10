@@ -1,5 +1,7 @@
 import math
+from collections.abc import Mapping
 from datetime import date, datetime
+from numbers import Real
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -93,17 +95,26 @@ class ValuationFundamentals(BaseModel):
             raise ValueError("bank metrics must be finite")
         return metrics
 
-    @field_validator("reit_metrics")
+    @field_validator("reit_metrics", mode="before")
     @classmethod
-    def validate_reit_metrics(cls, metrics: dict[str, float]) -> dict[str, float]:
+    def validate_reit_metrics(cls, metrics: object) -> object:
+        if not isinstance(metrics, Mapping):
+            return metrics
         unsupported = sorted(set(metrics) - APPROVED_REIT_METRIC_KEYS)
         if unsupported:
             raise ValueError(
                 f"unsupported REIT metric keys: {', '.join(unsupported)}"
             )
-        if any(not math.isfinite(value) for value in metrics.values()):
+        if any(
+            not isinstance(value, Real) or isinstance(value, bool)
+            for value in metrics.values()
+        ):
+            raise ValueError(
+                "REIT metric values must be real numbers and not booleans"
+            )
+        if any(not math.isfinite(float(value)) for value in metrics.values()):
             raise ValueError("REIT metrics must be finite")
-        return metrics
+        return dict(metrics)
 
 
 class ScenarioAssumptions(BaseModel):

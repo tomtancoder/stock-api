@@ -5,11 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import valuation_fundamentals
+from app.services import valuation_fundamentals, valuation_service
 from app.services.sec_companyfacts import SecCompanyFactsError
 from app.services.valuation_types import (
     FactProvenance,
     FinancialPeriod,
+    ModelResult,
     ValuationFundamentals,
 )
 from app.services.yfinance_statements import YFinanceStatementsError
@@ -114,6 +115,15 @@ def test_reit_metrics_reject_unapproved_keys():
 def test_reit_metrics_reject_non_finite_values():
     with pytest.raises(ValueError, match="REIT metrics must be finite"):
         _fundamentals(reit_metrics={"occupancy": float("nan")})
+
+
+@pytest.mark.parametrize("value", [True, "0.97", object()])
+def test_reit_metrics_reject_non_real_or_boolean_values_before_coercion(value):
+    with pytest.raises(
+        ValueError,
+        match="REIT metric values must be real numbers and not booleans",
+    ):
+        _fundamentals(reit_metrics={"occupancy": value})
 
 
 @pytest.fixture(autouse=True)
@@ -639,6 +649,55 @@ def test_facade_never_infers_reit_metrics_from_balance_sheet_rows(monkeypatch):
     assert "aggregate_leverage" not in merged.sources
 
 
+def test_facade_sanitizes_mutated_reit_metrics_and_stale_sources(monkeypatch):
+    yahoo = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:M44U",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        provider_security_type="REIT",
+        industry="REIT - Retail",
+        reit_metrics={"aggregate_leverage": 0.40},
+        sources={
+            "financial_statements": "yfinance",
+            "aggregate_leverage": "yfinance_info.aggregateLeverage",
+            "occupancy": "stale_occupancy_source",
+            "wale_years": "stale_wale_source",
+            "interest_coverage": "stale_interest_source",
+            "ffo": "unapproved_metric_source",
+        },
+    )
+    yahoo.reit_metrics.update(
+        {
+            "occupancy": float("nan"),
+            "wale_years": True,
+            "ffo": 100.0,
+        }
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    merged = valuation_fundamentals.get_fundamentals(
+        "SGX", "M44U"
+    ).fundamentals
+
+    assert merged.reit_metrics == {"aggregate_leverage": 0.40}
+    assert merged.sources["aggregate_leverage"] == (
+        "yfinance_info.aggregateLeverage"
+    )
+    for invalid_source in (
+        "occupancy",
+        "wale_years",
+        "interest_coverage",
+        "ffo",
+    ):
+        assert invalid_source not in merged.sources
+
+
 @pytest.mark.parametrize(
     ("fallback_currency", "fallback_period_end"),
     [
@@ -793,6 +852,65 @@ def test_sgx_goes_directly_to_yfinance_and_records_medium_confidence_cap(
     assert first == second
     assert first.fundamentals.primary_source == "yfinance_sgx"
     assert any("medium" in warning.lower() for warning in first.warnings)
+
+
+def test_complete_sgx_reit_drops_ordinary_gaps_and_keeps_medium_confidence(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    yahoo = _fundamentals(
+        exchange="SGX",
+        symbol="SGX:M44U",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        current_diluted_shares=1_000.0,
+        periods=[
+            _period(
+                period_end,
+                currency="SGD",
+                provider="yfinance",
+                diluted_shares=1_000.0,
+                distribution_per_unit=0.08,
+                nav_per_unit=1.20,
+            )
+        ],
+        missing_fields=[
+            "operating_cash_flow",
+            "capital_expenditure",
+            "net_income_common",
+        ],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: yahoo,
+    )
+
+    envelope = valuation_fundamentals.get_fundamentals("SGX", "M44U")
+    model_result = ModelResult(
+        method="reit_distribution_nav",
+        detected_company_type="reit",
+        bear=0.80,
+        base=1.00,
+        bull=1.20,
+        details={"usable_years": 3},
+        assumptions={},
+        quality={},
+    )
+
+    assert envelope.fundamentals.missing_fields == []
+    assert (
+        valuation_service._confidence(
+            envelope.fundamentals,
+            envelope,
+            model_result,
+        )
+        == "medium"
+    )
 
 
 def test_expired_refresh_failure_returns_usable_stale_entry(monkeypatch):

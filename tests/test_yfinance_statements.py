@@ -740,6 +740,91 @@ def test_reit_issuer_dpu_and_nav_are_not_overwritten_by_derived_values(
     assert annual.sources["nav_per_unit"].concept == "NAV Per Unit"
 
 
+def test_reit_dividend_keeps_provider_local_date_at_sgt_year_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        info={
+            "financialCurrency": "SGD",
+            "quoteType": "REIT",
+        },
+        dividends=pd.Series(
+            [0.02],
+            index=[pd.Timestamp("2025-01-01 00:30", tz="Asia/Singapore")],
+        ),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    annuals = [period for period in result.periods if not period.is_ttm]
+    assert [period.period_end.isoformat() for period in annuals] == [
+        "2025-12-31"
+    ]
+    assert annuals[0].distribution_per_unit == 0.02
+
+
+def test_reit_dividends_deduplicate_only_exact_date_amount_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    same_date = pd.Timestamp("2025-03-31", tz="Asia/Singapore")
+    ticker = FakeTicker(
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        dividends=pd.Series(
+            [0.01, 0.01, 0.02],
+            index=[same_date, same_date, same_date],
+        ),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    annual = next(period for period in result.periods if not period.is_ttm)
+    trailing = next(period for period in result.periods if period.is_ttm)
+    assert annual.distribution_per_unit == pytest.approx(0.03)
+    assert trailing.distribution_per_unit == pytest.approx(0.03)
+
+
+def test_reit_issuer_dpu_suppresses_same_fiscal_bucket_derived_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        cashflow={
+            "yearly": statement(
+                {"Distribution Per Unit": 0.09},
+                "2025-12-28",
+            )
+        },
+        info={
+            "financialCurrency": "SGD",
+            "quoteType": "REIT",
+            "fiscalYearEnd": "12-31",
+        },
+        dividends=pd.Series(
+            [0.01, 0.01, 0.01, 0.01],
+            index=pd.to_datetime(
+                ["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-20"]
+            ),
+        ),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    annuals = [
+        period
+        for period in result.periods
+        if not period.is_ttm and period.distribution_per_unit is not None
+    ]
+    assert len(annuals) == 1
+    assert annuals[0].period_end.isoformat() == "2025-12-28"
+    assert annuals[0].distribution_per_unit == 0.09
+    assert (
+        annuals[0].sources["distribution_per_unit"].concept
+        == "Distribution Per Unit"
+    )
+
+
 @pytest.mark.parametrize("equity", [0.0, -100.0])
 def test_reit_missing_compatible_positive_nav_stays_none(
     monkeypatch: pytest.MonkeyPatch, equity: float
@@ -789,6 +874,124 @@ def test_reit_replaces_nonpositive_statement_units_with_positive_unit_history(
     assert annual.nav_per_unit == pytest.approx(1.0)
 
 
+def test_reit_dividend_only_periods_receive_compatible_unit_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        info={
+            "financialCurrency": "SGD",
+            "quoteType": "REIT",
+            "fiscalYearEnd": "12-31",
+        },
+        shares=pd.Series(
+            [990.0, 1_000.0],
+            index=["2025-12-20", "2025-12-31"],
+        ),
+        dividends=pd.Series([0.02], index=pd.to_datetime(["2025-12-20"])),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    annual = next(period for period in result.periods if not period.is_ttm)
+    trailing = next(period for period in result.periods if period.is_ttm)
+    assert annual.diluted_shares == 1_000.0
+    assert annual.sources["diluted_shares"].period_end.isoformat() == (
+        "2025-12-31"
+    )
+    assert trailing.diluted_shares == 990.0
+    assert trailing.sources["diluted_shares"].period_end.isoformat() == (
+        "2025-12-20"
+    )
+
+
+@pytest.mark.parametrize(
+    ("observation_date", "expected_units"),
+    [
+        ("2025-11-30", 1_000.0),
+        ("2025-11-29", None),
+    ],
+)
+def test_reit_unit_history_uses_a_31_day_maximum_age_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_date: str,
+    expected_units: float | None,
+) -> None:
+    ticker = FakeTicker(
+        balance={
+            "yearly": statement({"Unitholder Equity": 1_000.0}, "2025-12-31")
+        },
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        shares=pd.Series([1_000.0], index=[observation_date]),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    annual = next(
+        period
+        for period in fetch_yfinance_fundamentals("SGX", "M44U").periods
+        if not period.is_ttm
+    )
+
+    assert annual.diluted_shares == expected_units
+    if expected_units is not None:
+        assert annual.sources["diluted_shares"].period_end.isoformat() == (
+            observation_date
+        )
+        assert annual.nav_per_unit is None
+    else:
+        assert "diluted_shares" not in annual.sources
+        assert annual.nav_per_unit is None
+
+
+def test_reit_stale_unit_history_cannot_populate_current_units_or_nav(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        balance={
+            "yearly": statement({"Unitholder Equity": 1_000.0}, "2025-12-31")
+        },
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        shares=pd.Series([1_000.0], index=["2020-12-31"]),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+    annual = next(period for period in result.periods if not period.is_ttm)
+
+    assert annual.diluted_shares is None
+    assert "diluted_shares" not in annual.sources
+    assert annual.nav_per_unit is None
+    assert "nav_per_unit" not in annual.sources
+    assert result.current_diluted_shares is None
+    assert "current_diluted_shares" in result.missing_fields
+
+
+def test_reit_nav_requires_unit_provenance_at_the_exact_financial_period_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        balance={
+            "yearly": statement({"Unitholder Equity": 1_000.0}, "2025-12-31")
+        },
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        shares=pd.Series([1_000.0], index=["2025-12-30"]),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    annual = next(
+        period
+        for period in fetch_yfinance_fundamentals("SGX", "M44U").periods
+        if not period.is_ttm
+    )
+
+    assert annual.diluted_shares == 1_000.0
+    assert annual.sources["diluted_shares"].period_end.isoformat() == (
+        "2025-12-30"
+    )
+    assert annual.nav_per_unit is None
+    assert "nav_per_unit" not in annual.sources
+
+
 def test_non_reit_does_not_read_dividend_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -801,3 +1004,60 @@ def test_non_reit_does_not_read_dividend_history(
     fetch_yfinance_fundamentals("SGX", "S63")
 
     assert ("dividends", None) not in ticker.calls
+
+
+def test_complete_reit_has_no_owner_earnings_missing_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        cashflow={
+            "yearly": statement({"Distribution Per Unit": 0.08}, "2025-12-31")
+        },
+        balance={
+            "yearly": statement({"NAV Per Unit": 1.20}, "2025-12-31")
+        },
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        shares=pd.Series([1_000.0], index=["2025-12-31"]),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    assert result.missing_fields == []
+
+
+def test_reit_missing_nav_reports_only_the_reit_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        cashflow={
+            "yearly": statement({"Distribution Per Unit": 0.08}, "2025-12-31")
+        },
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        shares=pd.Series([1_000.0], index=["2025-12-31"]),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    assert result.missing_fields == ["nav_per_unit"]
+
+
+def test_reit_trailing_dpu_excludes_the_exact_twelve_month_lower_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        info={"financialCurrency": "SGD", "quoteType": "REIT"},
+        dividends=pd.Series(
+            [0.50, 0.02, 0.03],
+            index=pd.to_datetime(
+                ["2024-12-31", "2025-01-01", "2025-12-31"]
+            ),
+        ),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    trailing = next(period for period in result.periods if period.is_ttm)
+    assert trailing.distribution_per_unit == pytest.approx(0.05)

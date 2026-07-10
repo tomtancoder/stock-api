@@ -1070,3 +1070,36 @@ def test_reit_facts_keep_units_latest_amendments_and_field_provenance(
     assert "affo" not in result.missing_fields
     assert "real_estate_depreciation" not in result.missing_fields
     assert "gain_on_property_sales" not in result.missing_fields
+
+
+def test_complete_sec_reit_has_no_owner_earnings_missing_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    facts = company_facts(
+        {
+            "CommonStockDividendsPerShareDeclared": {
+                "USD/shares": [sec_fact(0.12)]
+            },
+            "WeightedAverageNumberOfUnitsOutstanding": {
+                "shares": [sec_fact(1_000.0)]
+            },
+            "NetAssetValuePerShare": {
+                "USD/shares": [sec_fact(1.40, start=None)]
+            },
+        }
+    )
+    reit_submission = submissions() | {
+        "entityType": "REIT",
+        "sicDescription": "Real Estate Investment Trusts",
+    }
+    install_fetch_payloads(
+        monkeypatch,
+        facts,
+        submission_payload=reit_submission,
+    )
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NYSE", "AAPL")
+
+    assert result.missing_fields == []

@@ -99,13 +99,19 @@ _ADDITIVE_FIELDS = {
     if kind == "cashflow" or field in {"revenue", "net_income_common"}
 }
 _FACT_FIELDS = (*_FIELD_ALIASES, "interest_paid_outside_operating")
-_REIT_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
+_REIT_ONLY_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
+_REIT_REQUIRED_FACT_FIELDS = (
+    "distribution_per_unit",
+    "diluted_shares",
+    "nav_per_unit",
+)
 _CLASSIFICATION_KEYS = (
     "interestPaidClassification",
     "interest_paid_classification",
     "interestClassification",
     "interest_classification",
 )
+_MAX_UNIT_OBSERVATION_AGE_DAYS = 31
 
 
 def fetch_yfinance_fundamentals(
@@ -160,11 +166,23 @@ def fetch_yfinance_fundamentals(
             info,
             warnings,
         )
-    current_shares = _current_shares(shares, info, fast_info)
+    current_shares = (
+        _current_reit_shares(periods, info, fast_info)
+        if is_reit
+        else _current_shares(shares, info, fast_info)
+    )
+    required_fact_fields = (
+        _REIT_REQUIRED_FACT_FIELDS
+        if is_reit
+        else tuple(
+            field
+            for field in _FACT_FIELDS
+            if field not in _REIT_ONLY_FACT_FIELDS
+        )
+    )
     missing_fields = [
         field
-        for field in _FACT_FIELDS
-        if is_reit or field not in _REIT_FACT_FIELDS
+        for field in required_fact_fields
         if not any(getattr(period, field) is not None for period in periods)
     ]
     if current_shares is None:
@@ -409,12 +427,7 @@ def _normalize_reit_periods(
     info: Mapping[str, Any],
     warnings: list[str],
 ) -> list[FinancialPeriod]:
-    normalized = [
-        _add_reit_units(period, shares)
-        if period.currency.strip().upper() == currency
-        else period
-        for period in periods
-    ]
+    normalized = list(periods)
     observations = _dividend_observations(dividends)
     if observations:
         fiscal_year_end = _fiscal_year_end(info)
@@ -431,7 +444,15 @@ def _normalize_reit_periods(
             annual_totals[period_end] = (
                 annual_totals.get(period_end, 0.0) + amount
             )
+        issuer_distribution_buckets = {
+            _distribution_period_end(period.period_end, fiscal_year_end)
+            for period in normalized
+            if not period.is_ttm
+            and period.distribution_per_unit is not None
+        }
         for period_end, amount in annual_totals.items():
+            if period_end in issuer_distribution_buckets:
+                continue
             normalized = _add_distribution_period(
                 normalized,
                 period_end=period_end,
@@ -463,6 +484,12 @@ def _normalize_reit_periods(
                 form="dividend_history_ttm",
             )
 
+    normalized = [
+        _add_reit_units(period, shares)
+        if period.currency.strip().upper() == currency
+        else period
+        for period in normalized
+    ]
     normalized = [_derive_nav_per_unit(period) for period in normalized]
     return sorted(
         normalized,
@@ -473,13 +500,14 @@ def _normalize_reit_periods(
 def _add_reit_units(period: FinancialPeriod, shares: Any) -> FinancialPeriod:
     if _positive_float(period.diluted_shares) is not None:
         return period
-    units = _units_at_or_before(shares, period.period_end)
-    if units is None:
+    observation = _units_at_or_before(shares, period.period_end)
+    if observation is None:
         return period
+    observation_date, units = observation
     sources = dict(period.sources)
     sources["diluted_shares"] = _provenance(
         "get_shares_full",
-        period.period_end,
+        observation_date,
         "units",
         "share_history",
     )
@@ -488,32 +516,55 @@ def _add_reit_units(period: FinancialPeriod, shares: Any) -> FinancialPeriod:
     )
 
 
-def _units_at_or_before(shares: Any, period_end: date) -> float | None:
+def _units_at_or_before(
+    shares: Any, period_end: date
+) -> tuple[date, float] | None:
     if not isinstance(shares, pd.Series) or shares.empty:
         return None
-    candidates: list[tuple[pd.Timestamp, int, float]] = []
+    candidates: list[tuple[date, int, float]] = []
     for position, (raw_date, raw_value) in enumerate(shares.items()):
-        timestamp = _timestamp(raw_date)
+        observation_date = _provider_local_date(raw_date)
         units = _positive_float(raw_value)
-        if timestamp is None or timestamp.date() > period_end or units is None:
+        if observation_date is None or units is None:
             continue
-        candidates.append((timestamp, position, units))
+        age_days = (period_end - observation_date).days
+        if not 0 <= age_days <= _MAX_UNIT_OBSERVATION_AGE_DAYS:
+            continue
+        candidates.append((observation_date, position, units))
     if not candidates:
         return None
-    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    observation_date, _position, units = max(
+        candidates, key=lambda item: (item[0], item[1])
+    )
+    return observation_date, units
 
 
 def _dividend_observations(dividends: Any) -> list[tuple[date, float]]:
     if not isinstance(dividends, pd.Series) or dividends.empty:
         return []
     observations: list[tuple[date, float]] = []
+    seen: set[tuple[date, float]] = set()
     for raw_date, raw_value in dividends.items():
-        timestamp = _timestamp(raw_date)
+        local_date = _provider_local_date(raw_date)
         amount = _positive_float(raw_value)
-        if timestamp is None or amount is None:
+        if local_date is None or amount is None:
             continue
-        observations.append((timestamp.date(), amount))
+        observation = (local_date, amount)
+        if observation in seen:
+            continue
+        seen.add(observation)
+        observations.append(observation)
     return sorted(observations, key=lambda item: item[0])
+
+
+def _provider_local_date(value: Any) -> date | None:
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    return timestamp.date()
 
 
 def _fiscal_year_end(info: Mapping[str, Any]) -> tuple[int, int] | None:
@@ -1045,6 +1096,31 @@ def _current_shares(
             candidates.append((timestamp, position, number))
         if candidates:
             return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    return _current_shares_metadata(info, fast_info)
+
+
+def _current_reit_shares(
+    periods: list[FinancialPeriod],
+    info: Mapping[str, Any],
+    fast_info: Mapping[str, Any],
+) -> float | None:
+    candidates = [
+        period
+        for period in periods
+        if _positive_float(period.diluted_shares) is not None
+    ]
+    if candidates:
+        latest = max(
+            candidates,
+            key=lambda period: (period.period_end, period.is_ttm),
+        )
+        return _positive_float(latest.diluted_shares)
+    return _current_shares_metadata(info, fast_info)
+
+
+def _current_shares_metadata(
+    info: Mapping[str, Any], fast_info: Mapping[str, Any]
+) -> float | None:
     for candidate in (
         fast_info.get("shares"),
         fast_info.get("sharesOutstanding"),

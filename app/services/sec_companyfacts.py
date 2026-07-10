@@ -137,7 +137,12 @@ _ADDITIVE_FIELDS = frozenset(
     }
 )
 _FACT_FIELDS = tuple(_CONCEPTS)
-_REIT_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
+_REIT_ONLY_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
+_REIT_REQUIRED_FACT_FIELDS = (
+    "distribution_per_unit",
+    "diluted_shares",
+    "nav_per_unit",
+)
 _OPTIONAL_FACT_FIELDS = frozenset(
     {"real_estate_depreciation", "gain_on_property_sales"}
 )
@@ -196,11 +201,19 @@ def fetch_sec_fundamentals(
     current_shares = _latest_diluted_shares(periods)
     metadata = _submission_metadata(submissions_payload)
     is_reit = _metadata_is_reit(metadata)
+    required_fact_fields = (
+        _REIT_REQUIRED_FACT_FIELDS
+        if is_reit
+        else tuple(
+            field
+            for field in _FACT_FIELDS
+            if field not in _OPTIONAL_FACT_FIELDS
+            and field not in _REIT_ONLY_FACT_FIELDS
+        )
+    )
     missing_fields = [
         field
-        for field in _FACT_FIELDS
-        if field not in _OPTIONAL_FACT_FIELDS
-        if is_reit or field not in _REIT_FACT_FIELDS
+        for field in required_fact_fields
         if not any(getattr(period, field) is not None for period in periods)
     ]
     if current_shares is None:
