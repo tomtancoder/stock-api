@@ -5,6 +5,75 @@ from app.main import app
 client = TestClient(app)
 
 
+def _valuation_response_payload(*, unreliable: bool = False):
+    return {
+        "symbol": "SGX:S63",
+        "exchange": "SGX",
+        "currency": "SGD",
+        "detected_company_type": "reit" if unreliable else "operating_company",
+        "method": None if unreliable else "owner_earnings_dcf",
+        "classification_sources": [
+            "provider_industry",
+            "statement_structure",
+        ],
+        "status": "valuation_unreliable" if unreliable else "fair",
+        "confidence": None if unreliable else "medium",
+        "current_price": 7.15,
+        "price_as_of": "2026-07-10T10:15:00Z",
+        "intrinsic_value": (
+            None
+            if unreliable
+            else {
+                "bear": 5.8,
+                "base": 7.5,
+                "bull": 9.1,
+                "margin_of_safety_price": 5.625,
+                "price_to_base_value": 0.9533,
+                "upside_downside_percent": 4.9,
+            }
+        ),
+        "model_details": (
+            None
+            if unreliable
+            else {
+                "method": "owner_earnings_dcf",
+                "normalized_owner_earnings": 750.0,
+                "owner_earnings_per_share": 7.5,
+                "maintenance_capex_method": "total_capital_expenditure",
+                "annual_history": [],
+                "derived_growth": 0.04,
+                "usable_years": 5,
+            }
+        ),
+        "quality": {
+            "eligible": not unreliable,
+            "reasons": (
+                ["REIT valuation is recognized but not supported yet."]
+                if unreliable
+                else []
+            ),
+        },
+        "assumptions": (
+            {}
+            if unreliable
+            else {"projection_years": 10, "margin_of_safety": 0.25}
+        ),
+        "data_quality": {
+            "primary_source": "yfinance_sgx",
+            "financials_as_of": "2025-12-31",
+            "valuation_as_of": "2026-07-10T10:30:00Z",
+            "next_refresh_at": "2026-07-11T10:30:00Z",
+            "stale": False,
+            "missing_fields": [],
+        },
+        "sources": {
+            "operating_cash_flow": "yfinance_sgx",
+            "current_price": "existing_quote_provider",
+        },
+        "warnings": [],
+    }
+
+
 def test_health():
     response = client.get("/health")
 
@@ -57,6 +126,117 @@ def test_market_quote_endpoint_uses_tradingview_provider(monkeypatch):
     assert payload["change_percent"] == 1.1626
     assert payload["fifty_two_week_high"] == 555.45
     assert payload["fifty_two_week_low"] == 349.2
+
+
+def test_market_valuation_endpoint_returns_typed_service_response(monkeypatch):
+    from app.api.v1 import markets
+
+    def fake_valuation(exchange: str, symbol: str):
+        assert (exchange, symbol) == ("SGX", "S63")
+        return _valuation_response_payload()
+
+    monkeypatch.setattr(
+        markets.valuation_service, "get_valuation", fake_valuation
+    )
+
+    response = client.get("/api/v1/markets/SGX/S63/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "SGX:S63"
+    assert response.json()["method"] == "owner_earnings_dcf"
+
+
+def test_market_valuation_endpoint_maps_not_found_service_error(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            markets.valuation_service.ValuationServiceError(
+                "No valuation data found for SGX:MISSING.",
+                status_code=404,
+            )
+        ),
+    )
+
+    response = client.get("/api/v1/markets/SGX/MISSING/valuation")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "No valuation data found for SGX:MISSING."
+    )
+
+
+def test_market_valuation_endpoint_preserves_retry_after_on_502(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            markets.valuation_service.ValuationServiceError(
+                "Quote provider is busy.",
+                status_code=502,
+                retry_after_s=60,
+            )
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/valuation")
+
+    assert response.status_code == 502
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["detail"] == "Quote provider is busy."
+
+
+def test_market_valuation_endpoint_returns_unreliable_as_200(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: _valuation_response_payload(unreliable=True),
+    )
+
+    response = client.get("/api/v1/markets/SGX/C38U/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "valuation_unreliable"
+    assert response.json()["method"] is None
+
+
+def test_market_technical_endpoint_never_calls_valuation_service(monkeypatch):
+    from app.api.v1 import markets
+
+    valuation_calls = []
+    technical_calls = []
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: valuation_calls.append((exchange, symbol)),
+    )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_technical_analysis",
+        lambda exchange, symbol, timeframe, include_multi_timeframe: (
+            technical_calls.append(
+                (exchange, symbol, timeframe, include_multi_timeframe)
+            )
+            or {
+                "symbol": f"{exchange}:{symbol}",
+                "timeframe": timeframe,
+                "source": "tradingview_mcp",
+                "warnings": [],
+            }
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/technical")
+
+    assert response.status_code == 200
+    assert technical_calls == [("NASDAQ", "ACME", "1D", False)]
+    assert valuation_calls == []
 
 
 def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
