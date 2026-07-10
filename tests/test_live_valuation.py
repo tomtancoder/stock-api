@@ -143,7 +143,7 @@ def test_live_sgx_bank_valuation() -> None:
     }
     assert required_bank_source_fields <= valuation.sources.keys()
     assert all(
-        valuation.sources[field].startswith("yfinance")
+        valuation.sources[field] == "yfinance"
         for field in required_bank_source_fields
     )
     assert valuation.sources.get("current_price") == "existing_quote_provider"
