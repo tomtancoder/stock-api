@@ -141,7 +141,7 @@ def test_normalizes_reviewed_statement_aliases(
 
 
 @pytest.mark.parametrize("row_alias", ["Interest Paid Supplemental", "Interest Paid"])
-def test_financing_interest_metadata_records_zero_add_back(
+def test_financing_interest_metadata_preserves_actual_interest(
     monkeypatch: pytest.MonkeyPatch, row_alias: str
 ) -> None:
     ticker = FakeTicker(
@@ -155,10 +155,9 @@ def test_financing_interest_metadata_records_zero_add_back(
 
     period = fetch_yfinance_fundamentals("SGX", "D05").periods[0]
 
-    assert period.interest_paid_outside_operating == 0.0
+    assert period.interest_paid_outside_operating == -17.0
     assert (
-        period.sources["interest_paid_outside_operating"].concept
-        == "outside_operating_cash_flow"
+        period.sources["interest_paid_outside_operating"].concept == row_alias
     )
 
 
@@ -180,7 +179,7 @@ def test_interest_stays_missing_when_classification_is_unknown(
     assert "interest_paid_outside_operating" not in period.sources
 
 
-def test_operating_interest_metadata_preserves_actual_interest(
+def test_operating_interest_metadata_records_resolved_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ticker = FakeTicker(
@@ -202,10 +201,10 @@ def test_operating_interest_metadata_preserves_actual_interest(
 
     period = fetch_yfinance_fundamentals("SGX", "D05").periods[0]
 
-    assert period.interest_paid_outside_operating == -17.0
+    assert period.interest_paid_outside_operating == 0.0
     assert (
         period.sources["interest_paid_outside_operating"].concept
-        == "Interest Paid"
+        == "included_in_operating_cash_flow"
     )
 
 
@@ -228,15 +227,15 @@ def test_interest_classification_is_specific_to_statement_frequency(
     result = fetch_yfinance_fundamentals("SGX", "D05")
 
     annual_period, trailing_period = result.periods
-    assert annual_period.interest_paid_outside_operating == -11.0
+    assert annual_period.interest_paid_outside_operating == 0.0
     assert (
         annual_period.sources["interest_paid_outside_operating"].concept
-        == "Interest Paid"
+        == "included_in_operating_cash_flow"
     )
-    assert trailing_period.interest_paid_outside_operating == 0.0
+    assert trailing_period.interest_paid_outside_operating == -13.0
     assert (
         trailing_period.sources["interest_paid_outside_operating"].concept
-        == "outside_operating_cash_flow"
+        == "Interest Paid"
     )
 
 

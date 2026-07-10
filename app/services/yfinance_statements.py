@@ -523,9 +523,9 @@ def _period_interest(
     classification: Literal["inside", "outside"] | None,
 ) -> tuple[float, str] | None:
     if classification == "inside":
-        return _extract_value(frame, period_end, _INTEREST_ALIASES)
+        return 0.0, "included_in_operating_cash_flow"
     if classification == "outside":
-        return 0.0, "outside_operating_cash_flow"
+        return _extract_value(frame, period_end, _INTEREST_ALIASES)
     return None
 
 
@@ -535,9 +535,9 @@ def _quarterly_interest(
     classification: Literal["inside", "outside"] | None,
 ) -> tuple[float, str] | None:
     if classification == "inside":
-        return _sum_quarters(frame, period_ends, _INTEREST_ALIASES)
+        return 0.0, "included_in_operating_cash_flow"
     if classification == "outside":
-        return 0.0, "outside_operating_cash_flow"
+        return _sum_quarters(frame, period_ends, _INTEREST_ALIASES)
     return None
 
 
