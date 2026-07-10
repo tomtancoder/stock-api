@@ -228,14 +228,14 @@ def _fetch_uncached(
             fetch_sec_fundamentals(exchange, symbol)
         )
         if not _needs_yfinance_fallback(primary):
-            return _derive_reit_period_values(primary), ()
+            return _finalize_normalized_fundamentals(primary), ()
         try:
             fallback = _normalize_provider_metrics(
                 fetch_yfinance_fundamentals(exchange, symbol)
             )
         except YFinanceStatementsError as exc:
             warning = f"Optional yFinance fundamentals fallback failed: {exc}"
-            return _derive_reit_period_values(primary), (warning,)
+            return _finalize_normalized_fundamentals(primary), (warning,)
         return _merge_sec_with_yfinance(primary, fallback)
 
     fundamentals = _finalize_fundamentals(
@@ -271,7 +271,11 @@ def _merge_sec_with_yfinance(
             "Ignored yFinance fundamentals fallback because its symbol or "
             "exchange did not match the SEC result."
         )
-        return primary, _unique(warnings)
+        finalized = _finalize_normalized_fundamentals(primary)
+        finalized = finalized.model_copy(
+            update={"warnings": list(_unique(warnings))}
+        )
+        return finalized, _unique(warnings)
 
     currency = primary.currency.strip().upper()
     if fallback.currency.strip().upper() != currency:
@@ -279,7 +283,11 @@ def _merge_sec_with_yfinance(
             "Ignored yFinance fundamentals fallback currency "
             f"{fallback.currency}; expected {primary.currency}."
         )
-        return primary, _unique(warnings)
+        finalized = _finalize_normalized_fundamentals(primary)
+        finalized = finalized.model_copy(
+            update={"warnings": list(_unique(warnings))}
+        )
+        return finalized, _unique(warnings)
 
     fallback_periods = {
         (period.period_end, period.is_ttm): period
@@ -389,11 +397,11 @@ def _merge_sec_with_yfinance(
         )
     top_level_updates["sources"] = sources
 
-    candidate = primary.model_copy(update=top_level_updates)
-    candidate = _derive_reit_period_values(candidate)
+    candidate = _finalize_normalized_fundamentals(
+        primary.model_copy(update=top_level_updates)
+    )
     candidate = candidate.model_copy(
         update={
-            "missing_fields": _remaining_missing_fields(candidate),
             "warnings": list(_unique(warnings)),
         }
     )
@@ -463,7 +471,13 @@ def _finalize_fundamentals(
     fundamentals: ValuationFundamentals,
 ) -> ValuationFundamentals:
     normalized = _normalize_provider_metrics(fundamentals)
-    derived = _derive_reit_period_values(normalized)
+    return _finalize_normalized_fundamentals(normalized)
+
+
+def _finalize_normalized_fundamentals(
+    fundamentals: ValuationFundamentals,
+) -> ValuationFundamentals:
+    derived = _derive_reit_period_values(fundamentals)
     return derived.model_copy(
         update={"missing_fields": _remaining_missing_fields(derived)}
     )

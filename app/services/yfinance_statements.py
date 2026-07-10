@@ -450,8 +450,12 @@ def _normalize_reit_periods(
             if not period.is_ttm
             and period.distribution_per_unit is not None
         }
+        current_date = _current_date()
         for period_end, amount in annual_totals.items():
-            if period_end in issuer_distribution_buckets:
+            if (
+                period_end > current_date
+                or period_end in issuer_distribution_buckets
+            ):
                 continue
             normalized = _add_distribution_period(
                 normalized,
@@ -565,6 +569,10 @@ def _provider_local_date(value: Any) -> date | None:
     if pd.isna(timestamp):
         return None
     return timestamp.date()
+
+
+def _current_date() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 def _fiscal_year_end(info: Mapping[str, Any]) -> tuple[int, int] | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -1061,3 +1062,44 @@ def test_reit_trailing_dpu_excludes_the_exact_twelve_month_lower_bound(
 
     trailing = next(period for period in result.periods if period.is_ttm)
     assert trailing.distribution_per_unit == pytest.approx(0.05)
+
+
+def test_reit_partial_current_fiscal_bucket_stays_trailing_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        yfinance_statements,
+        "_current_date",
+        lambda: date(2026, 7, 10),
+        raising=False,
+    )
+    ticker = FakeTicker(
+        info={
+            "financialCurrency": "SGD",
+            "quoteType": "REIT",
+            "fiscalYearEnd": "12-31",
+        },
+        dividends=pd.Series(
+            [0.02, 0.03],
+            index=pd.to_datetime(["2025-03-31", "2026-03-31"]),
+        ),
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "M44U")
+
+    annuals = [
+        period
+        for period in result.periods
+        if not period.is_ttm and period.distribution_per_unit is not None
+    ]
+    assert [period.period_end.isoformat() for period in annuals] == [
+        "2025-12-31"
+    ]
+    assert annuals[0].distribution_per_unit == 0.02
+    trailing = next(period for period in result.periods if period.is_ttm)
+    assert trailing.period_end.isoformat() == "2026-03-31"
+    assert trailing.distribution_per_unit == 0.03
+    assert max(period.period_end for period in result.periods) <= date(
+        2026, 7, 10
+    )

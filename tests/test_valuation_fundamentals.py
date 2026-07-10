@@ -504,6 +504,114 @@ def test_sec_facade_derives_reit_dpu_and_nav_only_from_compatible_raw_facts(
     assert "nav_per_unit" not in merged.missing_fields
 
 
+def test_sec_reit_finalizes_primary_when_optional_yfinance_fallback_fails(
+    monkeypatch,
+):
+    period_end = date(2025, 12, 31)
+    primary = _fundamentals(
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[
+            _period(
+                period_end,
+                common_dividends=120.0,
+                common_equity=1_600.0,
+                diluted_shares=1_000.0,
+            )
+        ],
+        warnings=["SEC primary warning"],
+    )
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: primary,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            YFinanceStatementsError("fallback unavailable")
+        ),
+    )
+
+    envelope = valuation_fundamentals.get_fundamentals("NYSE", "REIT")
+
+    period = envelope.fundamentals.periods[0]
+    assert period.distribution_per_unit == pytest.approx(0.12)
+    assert period.nav_per_unit == pytest.approx(1.60)
+    assert envelope.fundamentals.missing_fields == []
+    assert "SEC primary warning" in envelope.warnings
+    assert any("fallback unavailable" in warning for warning in envelope.warnings)
+
+
+@pytest.mark.parametrize(
+    ("fallback_updates", "warning_text"),
+    [
+        ({"symbol": "NYSE:OTHER"}, "symbol or exchange"),
+        ({"currency": "SGD"}, "fallback currency"),
+    ],
+)
+def test_sec_reit_finalizes_primary_when_yfinance_fallback_is_rejected(
+    monkeypatch,
+    fallback_updates,
+    warning_text,
+):
+    period_end = date(2025, 12, 31)
+    primary = _fundamentals(
+        exchange="NYSE",
+        symbol="NYSE:REIT",
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Retail",
+        missing_fields=["distribution_per_unit", "nav_per_unit"],
+        periods=[
+            _period(
+                period_end,
+                common_dividends=120.0,
+                common_equity=1_600.0,
+                diluted_shares=1_000.0,
+            )
+        ],
+        warnings=["SEC primary warning"],
+    )
+    fallback_values = {
+        "exchange": "NYSE",
+        "symbol": "NYSE:REIT",
+        "primary_source": "yfinance_fallback",
+        "provider_security_type": "REIT",
+        "sector": "Real Estate",
+        "industry": "REIT - Retail",
+        "periods": [
+            _period(period_end, provider="yfinance", revenue=500.0)
+        ],
+    }
+    fallback_values.update(fallback_updates)
+    fallback = _fundamentals(**fallback_values)
+    monkeypatch.setattr(valuation_fundamentals, "get_settings", _settings)
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_sec_fundamentals",
+        lambda exchange, symbol: primary,
+    )
+    monkeypatch.setattr(
+        valuation_fundamentals,
+        "fetch_yfinance_fundamentals",
+        lambda exchange, symbol: fallback,
+    )
+
+    envelope = valuation_fundamentals.get_fundamentals("NYSE", "REIT")
+
+    period = envelope.fundamentals.periods[0]
+    assert period.distribution_per_unit == pytest.approx(0.12)
+    assert period.nav_per_unit == pytest.approx(1.60)
+    assert envelope.fundamentals.missing_fields == []
+    assert "SEC primary warning" in envelope.warnings
+    assert any(warning_text in warning for warning in envelope.warnings)
+
+
 @pytest.mark.parametrize(
     ("invalid_field", "invalid_unit"),
     [
