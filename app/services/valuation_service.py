@@ -234,10 +234,11 @@ def _get_model_result(
     envelope: FundamentalsEnvelope,
     now: datetime,
 ) -> ModelResult:
+    requested_version = VALUATION_MODEL_VERSION
     fetched_at = _as_utc(fundamentals.fetched_at)
     key = (
         public_symbol,
-        VALUATION_MODEL_VERSION,
+        requested_version,
         fetched_at.isoformat(),
     )
     fresh_until = _as_utc(envelope.fresh_until)
@@ -246,8 +247,14 @@ def _get_model_result(
     while True:
         with _MODEL_CACHE_LOCK:
             _prune_expired_model_entries(lookup_time)
+            _retire_obsolete_model_version(public_symbol)
             current_key = _MODEL_CURRENT_KEYS.get(public_symbol)
-            if current_key != key:
+            promotes = _model_key_promotes(
+                key,
+                current_key,
+                requested_version=requested_version,
+            )
+            if promotes and current_key != key:
                 _MODEL_CURRENT_KEYS[public_symbol] = key
                 for sibling_key in tuple(_MODEL_CACHE):
                     if (
@@ -255,7 +262,11 @@ def _get_model_result(
                         and sibling_key != key
                     ):
                         del _MODEL_CACHE[sibling_key]
-            cached = _MODEL_CACHE.get(key)
+            cached = (
+                _MODEL_CACHE.get(key)
+                if _MODEL_CURRENT_KEYS.get(public_symbol) == key
+                else None
+            )
             if cached is not None:
                 return cached.result.model_copy(deep=True)
             flight = _MODEL_IN_FLIGHT.get(key)
@@ -298,6 +309,7 @@ def _complete_successful_model(
             owns_flight
             and flight.generation == _MODEL_GENERATION
             and _MODEL_CURRENT_KEYS.get(key[0]) == key
+            and key[1] == VALUATION_MODEL_VERSION
         )
         if may_store:
             if entry is not None:
@@ -306,6 +318,12 @@ def _complete_successful_model(
                 del _MODEL_CURRENT_KEYS[key[0]]
         if owns_flight:
             del _MODEL_IN_FLIGHT[key]
+            if (
+                _MODEL_CURRENT_KEYS.get(key[0]) == key
+                and key[1] != VALUATION_MODEL_VERSION
+            ):
+                _MODEL_CACHE.pop(key, None)
+                del _MODEL_CURRENT_KEYS[key[0]]
         flight.result = shared_result
         flight.event.set()
     return result.model_copy(deep=True)
@@ -333,6 +351,35 @@ def _prune_expired_model_entries(now: datetime) -> None:
         del _MODEL_CACHE[cached_key]
         if _MODEL_CURRENT_KEYS.get(cached_key[0]) == cached_key:
             del _MODEL_CURRENT_KEYS[cached_key[0]]
+
+
+def _retire_obsolete_model_version(public_symbol: str) -> None:
+    current_key = _MODEL_CURRENT_KEYS.get(public_symbol)
+    if current_key is None or current_key[1] == VALUATION_MODEL_VERSION:
+        return
+    _MODEL_CACHE.pop(current_key, None)
+    del _MODEL_CURRENT_KEYS[public_symbol]
+
+
+def _model_key_promotes(
+    requested_key: _ModelCacheKey,
+    current_key: _ModelCacheKey | None,
+    *,
+    requested_version: str,
+) -> bool:
+    if requested_version != VALUATION_MODEL_VERSION:
+        return False
+    if current_key is None or current_key[1] != requested_version:
+        return True
+    if current_key == requested_key:
+        return True
+    return _model_key_fetched_at(requested_key) > _model_key_fetched_at(
+        current_key
+    )
+
+
+def _model_key_fetched_at(key: _ModelCacheKey) -> datetime:
+    return _as_utc(datetime.fromisoformat(key[2]))
 
 
 def _get_quote(

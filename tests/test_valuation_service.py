@@ -1229,3 +1229,160 @@ def test_slow_old_model_sibling_cannot_replace_newer_current_key(
     }
     assert valuation_service._MODEL_IN_FLIGHT == {}
     assert calls == 2
+
+
+def test_older_fundamentals_request_is_non_promoting_after_newer_cache(
+    monkeypatch, fake_clock
+):
+    old_fundamentals = _fundamentals()
+    newer_fetched_at = FETCHED_AT + timedelta(seconds=1)
+    new_fundamentals = old_fundamentals.model_copy(
+        deep=True,
+        update={"fetched_at": newer_fetched_at},
+    )
+    old_result = _model_result()
+    new_result = _model_result().model_copy(
+        deep=True,
+        update={"bear": 10.0, "base": 20.0, "bull": 30.0},
+    )
+    old_started = Event()
+    release_old = Event()
+    calls = 0
+    old_results = []
+    old_errors: list[BaseException] = []
+
+    def ordered_model(candidate):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return new_result
+        if calls == 2:
+            old_started.set()
+            assert release_old.wait(2), "test did not release older request"
+            return old_result
+        return new_result
+
+    monkeypatch.setattr(valuation_service, "route_valuation", ordered_model)
+    initial = valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        new_fundamentals,
+        _envelope(new_fundamentals),
+        NOW,
+    )
+    newer_key = (
+        "NASDAQ:ACME",
+        "1",
+        newer_fetched_at.isoformat(),
+    )
+    old_caller = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_model_result(
+                "NASDAQ:ACME",
+                old_fundamentals,
+                _envelope(old_fundamentals),
+                NOW,
+            ),
+            old_results,
+            old_errors,
+        ),
+    )
+    old_caller.start()
+    assert old_started.wait(2), "older request did not start"
+    current_while_old_runs = dict(valuation_service._MODEL_CURRENT_KEYS)
+    cached_while_old_runs = list(valuation_service._MODEL_CACHE)
+    release_old.set()
+    old_caller.join(2)
+    subsequent = valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        new_fundamentals,
+        _envelope(new_fundamentals),
+        NOW,
+    )
+
+    assert not old_caller.is_alive()
+    assert old_errors == []
+    assert initial.base == 20.0
+    assert old_results[0].base == 7.5
+    assert subsequent.base == 20.0
+    assert current_while_old_runs == {"NASDAQ:ACME": newer_key}
+    assert cached_while_old_runs == [newer_key]
+    assert valuation_service._MODEL_CURRENT_KEYS == {
+        "NASDAQ:ACME": newer_key
+    }
+    assert list(valuation_service._MODEL_CACHE) == [newer_key]
+    assert valuation_service._MODEL_IN_FLIGHT == {}
+    assert calls == 2
+
+
+def test_old_model_version_completion_is_non_promoting(
+    monkeypatch, fake_clock
+):
+    fundamentals = _fundamentals()
+    old_result = _model_result()
+    new_result = _model_result().model_copy(
+        deep=True,
+        update={"bear": 10.0, "base": 20.0, "bull": 30.0},
+    )
+    old_started = Event()
+    release_old = Event()
+    calls = 0
+    old_results = []
+    old_errors: list[BaseException] = []
+
+    def ordered_model(candidate):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            old_started.set()
+            assert release_old.wait(2), "test did not release old version"
+            return old_result
+        return new_result
+
+    monkeypatch.setattr(valuation_service, "route_valuation", ordered_model)
+    old_caller = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_model_result(
+                "NASDAQ:ACME",
+                fundamentals,
+                _envelope(fundamentals),
+                NOW,
+            ),
+            old_results,
+            old_errors,
+        ),
+    )
+    old_caller.start()
+    assert old_started.wait(2), "old model version did not start"
+
+    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "2")
+    release_old.set()
+    old_caller.join(2)
+    cache_after_old_completion = dict(valuation_service._MODEL_CACHE)
+    current_after_old_completion = dict(
+        valuation_service._MODEL_CURRENT_KEYS
+    )
+    current = valuation_service._get_model_result(
+        "NASDAQ:ACME",
+        fundamentals,
+        _envelope(fundamentals),
+        NOW,
+    )
+
+    current_key = (
+        "NASDAQ:ACME",
+        "2",
+        FETCHED_AT.isoformat(),
+    )
+    assert not old_caller.is_alive()
+    assert old_errors == []
+    assert old_results[0].base == 7.5
+    assert cache_after_old_completion == {}
+    assert current_after_old_completion == {}
+    assert current.base == 20.0
+    assert list(valuation_service._MODEL_CACHE) == [current_key]
+    assert valuation_service._MODEL_CURRENT_KEYS == {
+        "NASDAQ:ACME": current_key
+    }
+    assert calls == 2
