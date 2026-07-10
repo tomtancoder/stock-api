@@ -37,13 +37,12 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /api/v1/sentiment/{symbol}`
 - `GET /api/v1/news`
 
-Legacy stock routes remain as compatibility aliases:
+Legacy stock compatibility is limited to the quote and technical-analysis GET routes. New clients should use the canonical market `/analysis` and `/technical` routes directly; the retained aliases are:
 
 - `GET /api/v1/stocks/{symbol}/quote`
 - `GET /api/v1/stocks/{symbol}/technicals`
-- `POST /api/v1/stocks/{symbol}/valuation`
 
-`GET /api/v1/stocks/{symbol}/fundamentals` and the legacy `POST /api/v1/stocks/{symbol}/valuation` return `501`. The legacy POST is not an alias for the canonical market valuation GET.
+The legacy `GET /api/v1/stocks/{symbol}/fundamentals` and `POST /api/v1/stocks/{symbol}/valuation` are not compatibility aliases. They are retained only to return `501`; in particular, the legacy valuation POST is not an alias for the canonical market valuation GET.
 
 Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
 Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
@@ -117,7 +116,7 @@ The response reports finite positive `bear`, `base`, and `bull` values ordered f
 
 `sources` provides field-level provider identifiers, including `current_price: "existing_quote_provider"`. `data_quality` reports `primary_source`, `financials_as_of`, `valuation_as_of`, `next_refresh_at`, `stale`, and `missing_fields`; `price_as_of` is a separate top-level timestamp. U.S. fundamentals use SEC Company Facts first only when `STOCK_API_SEC_USER_AGENT` is configured. Otherwise the endpoint uses yFinance fallback fundamentals, adds a warning, and cannot return high confidence. SGX fundamentals use yFinance, preserve `SGD`, and are capped at medium confidence; missing facts or stale data can lower confidence further.
 
-Normalized fundamentals and intrinsic scenarios refresh once daily by default, while the current quote refreshes independently every five minutes. If a fundamentals refresh fails while a usable cached entry remains inside the stale window, the endpoint returns it with `data_quality.stale: true`, a warning, and low confidence. Without usable cached data, provider failure returns `502`; unresolved symbols return `404`.
+Normalized fundamentals and intrinsic scenarios refresh once daily by default, while the current quote refreshes independently every five minutes. If a fundamentals refresh fails while a usable cached entry remains inside the stale window, the endpoint returns it with `data_quality.stale: true`, a warning, and low confidence. Without usable cached data, provider failure returns `502`. A `404` is returned only when an upstream provider conclusively identifies the symbol as not found, such as a typed SEC or quote not-found response. yFinance fundamentals failures return `502`, including unresolved symbols that yFinance does not distinguish from other upstream failures.
 
 yFinance is an unofficial, provider-dependent source that may be incomplete, delayed, or unavailable. Production deployments that require guaranteed market-data rights or service levels should replace it through the existing provider boundary with an appropriately licensed source.
 

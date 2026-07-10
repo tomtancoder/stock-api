@@ -500,7 +500,7 @@ Illustrative response shape (annual history and the source map are shortened for
 
 Fundamentals and intrinsic scenarios use the daily valuation cache (`86400` seconds by default). Quotes use a separate five-minute cache (`300` seconds by default), so price-dependent ratios and labels can change without recalculating intrinsic value. A changed normalized-fundamentals timestamp or model version invalidates the model result.
 
-When fundamentals refresh fails, an otherwise usable cache entry can be served for the stale window (`604800` seconds by default). The response then sets `data_quality.stale` to `true`, adds a warning, and reports low confidence. If there is no usable stale entry, required provider failure returns `502`; an unresolved symbol returns `404`. Provider retry metadata such as `Retry-After` is preserved when available.
+When fundamentals refresh fails, an otherwise usable cache entry can be served for the stale window (`604800` seconds by default). The response then sets `data_quality.stale` to `true`, adds a warning, and reports low confidence. If there is no usable stale entry, required provider failure returns `502`. A `404` is returned only when an upstream provider conclusively identifies the symbol as not found, such as a typed SEC or quote not-found response. yFinance fundamentals failures return `502`, including unresolved symbols that yFinance does not distinguish from other upstream failures. Provider retry metadata such as `Retry-After` is preserved when available.
 
 yFinance is an unofficial, provider-dependent source and may be incomplete, delayed, rate-limited, or unavailable. It is not an exchange-authoritative SGX feed. A production deployment that requires guaranteed data rights or service levels should implement an appropriately licensed source behind the existing provider interface; valuation math does not depend on a provider-specific payload.
 
@@ -851,13 +851,13 @@ Common responses:
 | HTTP Status | Meaning |
 | --- | --- |
 | `200` | Request succeeded; valuation may intentionally report `valuation_unreliable` without numerical claims |
-| `404` | Symbol or data not found |
+| `404` | An upstream provider conclusively identified the symbol or data as not found |
 | `422` | Request validation failed |
 | `500` | Missing server dependency or configuration issue |
-| `502` | Upstream provider error |
+| `502` | Upstream provider error, including unresolved yFinance fundamentals failures that are not conclusively distinguishable from other failures |
 | `503` | Retryable upstream provider error |
 
-Example error:
+Example conclusive not-found error:
 
 ```json
 {
@@ -867,10 +867,10 @@ Example error:
 
 Client recommendations:
 
-- Treat `404` as a symbol/data availability issue.
+- Treat `404` as a conclusive symbol/data not-found result from an upstream provider.
 - Treat `422` as a request-shape bug in the client.
 - Retry `503` with backoff.
-- Do not aggressively retry `502`; show a temporary provider error to the user.
+- Treat `502` as a temporary provider error. It can also represent an unresolved symbol when yFinance fundamentals retrieval does not distinguish not-found from upstream failure.
 - Treat `200` plus `status: "valuation_unreliable"` as a supported refusal, and show `quality.reasons` rather than inventing a value.
 - Market data is provider-dependent and may change during trading hours.
 
