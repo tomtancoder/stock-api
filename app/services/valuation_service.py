@@ -4,7 +4,7 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import Any, Mapping
 
@@ -64,12 +64,33 @@ class _QuoteCacheEntry:
     expires_at: float
 
 
+@dataclass(slots=True)
+class _ModelFlight:
+    event: Event
+    generation: int
+    result: ModelResult | None = None
+    error: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _QuoteFlight:
+    event: Event
+    generation: int
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
+
+
 _ModelCacheKey = tuple[str, str, str]
 _QuoteCacheKey = tuple[str, str]
 
 _MODEL_CACHE: dict[_ModelCacheKey, _ModelCacheEntry] = {}
+_MODEL_IN_FLIGHT: dict[_ModelCacheKey, _ModelFlight] = {}
+_MODEL_GENERATION = 0
+_MODEL_CACHE_LOCK = Lock()
 _QUOTE_CACHE: dict[_QuoteCacheKey, _QuoteCacheEntry] = {}
-_CACHE_LOCK = Lock()
+_QUOTE_IN_FLIGHT: dict[_QuoteCacheKey, _QuoteFlight] = {}
+_QUOTE_GENERATION = 0
+_QUOTE_CACHE_LOCK = Lock()
 
 
 def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
@@ -219,35 +240,115 @@ def _get_model_result(
         fetched_at.isoformat(),
     )
     fresh_until = _as_utc(envelope.fresh_until)
-    with _CACHE_LOCK:
-        cached = _MODEL_CACHE.get(key)
-        if cached is not None and now < cached.fresh_until:
-            return cached.result.model_copy(deep=True)
+    flight: _ModelFlight
+    while True:
+        with _MODEL_CACHE_LOCK:
+            cached = _MODEL_CACHE.get(key)
+            if cached is not None and now < cached.fresh_until:
+                return cached.result.model_copy(deep=True)
+            if cached is not None:
+                del _MODEL_CACHE[key]
+            flight = _MODEL_IN_FLIGHT.get(key)
+            if flight is None:
+                flight = _ModelFlight(
+                    event=Event(), generation=_MODEL_GENERATION
+                )
+                _MODEL_IN_FLIGHT[key] = flight
+                break
+        flight.event.wait()
+        if flight.result is not None:
+            return flight.result.model_copy(deep=True)
+        if flight.error is not None:
+            raise flight.error
 
-    result = route_valuation(fundamentals)
-    stored = result.model_copy(deep=True)
-    with _CACHE_LOCK:
-        for stale_key in tuple(_MODEL_CACHE):
-            if stale_key[0] == public_symbol and stale_key != key:
-                del _MODEL_CACHE[stale_key]
-        if now < fresh_until:
-            _MODEL_CACHE[key] = _ModelCacheEntry(
-                result=stored,
-                fresh_until=fresh_until,
-            )
+    try:
+        result = route_valuation(fundamentals)
+        stored = result.model_copy(deep=True)
+        entry = (
+            _ModelCacheEntry(result=stored, fresh_until=fresh_until)
+            if _utc_now() < fresh_until
+            else None
+        )
+    except BaseException as exc:  # noqa: BLE001 - release all waiters.
+        return _complete_failed_model(key, flight, exc)
+    return _complete_successful_model(key, flight, result, entry)
+
+
+def _complete_successful_model(
+    key: _ModelCacheKey,
+    flight: _ModelFlight,
+    result: ModelResult,
+    entry: _ModelCacheEntry | None,
+) -> ModelResult:
+    shared_result = result.model_copy(deep=True)
+    with _MODEL_CACHE_LOCK:
+        owns_generation = (
+            _MODEL_IN_FLIGHT.get(key) is flight
+            and flight.generation == _MODEL_GENERATION
+        )
+        if owns_generation:
+            if entry is not None:
+                _MODEL_CACHE[key] = entry
+            del _MODEL_IN_FLIGHT[key]
+        flight.result = shared_result
+        flight.event.set()
     return result.model_copy(deep=True)
+
+
+def _complete_failed_model(
+    key: _ModelCacheKey,
+    flight: _ModelFlight,
+    exc: BaseException,
+):
+    with _MODEL_CACHE_LOCK:
+        if _MODEL_IN_FLIGHT.get(key) is flight:
+            del _MODEL_IN_FLIGHT[key]
+        flight.error = exc
+        flight.event.set()
+    raise exc
 
 
 def _get_quote(
     exchange: str, symbol: str, public_symbol: str
 ) -> dict[str, Any]:
     key = (exchange, public_symbol)
-    now = monotonic()
-    with _CACHE_LOCK:
-        cached = _QUOTE_CACHE.get(key)
-        if cached is not None and now < cached.expires_at:
-            return deepcopy(cached.payload)
+    flight: _QuoteFlight
+    while True:
+        now = monotonic()
+        with _QUOTE_CACHE_LOCK:
+            cached = _QUOTE_CACHE.get(key)
+            if cached is not None and now < cached.expires_at:
+                return deepcopy(cached.payload)
+            if cached is not None:
+                del _QUOTE_CACHE[key]
+            flight = _QUOTE_IN_FLIGHT.get(key)
+            if flight is None:
+                flight = _QuoteFlight(
+                    event=Event(), generation=_QUOTE_GENERATION
+                )
+                _QUOTE_IN_FLIGHT[key] = flight
+                break
+        flight.event.wait()
+        if flight.result is not None:
+            return deepcopy(flight.result)
+        if flight.error is not None:
+            raise flight.error
 
+    try:
+        normalized = _fetch_quote_uncached(exchange, symbol)
+        ttl = int(get_settings().valuation_quote_ttl_seconds)
+        entry = _QuoteCacheEntry(
+            payload=deepcopy(normalized),
+            expires_at=monotonic() + ttl,
+        )
+    except BaseException as exc:  # noqa: BLE001 - release all waiters.
+        return _complete_failed_quote(key, flight, exc)
+    return _complete_successful_quote(key, flight, normalized, entry)
+
+
+def _fetch_quote_uncached(
+    exchange: str, symbol: str
+) -> dict[str, Any]:
     try:
         payload = tradingview_provider.get_quote(exchange, symbol)
     except tradingview_provider.TradingViewProviderError as exc:
@@ -267,12 +368,40 @@ def _get_quote(
     normalized = deepcopy(dict(payload))
     _quote_price(normalized)
     _currency(normalized.get("currency"), "Quote currency is missing or invalid.")
-    ttl = int(get_settings().valuation_quote_ttl_seconds)
-    with _CACHE_LOCK:
-        _QUOTE_CACHE[key] = _QuoteCacheEntry(
-            payload=deepcopy(normalized), expires_at=now + ttl
-        )
     return normalized
+
+
+def _complete_successful_quote(
+    key: _QuoteCacheKey,
+    flight: _QuoteFlight,
+    result: dict[str, Any],
+    entry: _QuoteCacheEntry,
+) -> dict[str, Any]:
+    shared_result = deepcopy(result)
+    with _QUOTE_CACHE_LOCK:
+        owns_generation = (
+            _QUOTE_IN_FLIGHT.get(key) is flight
+            and flight.generation == _QUOTE_GENERATION
+        )
+        if owns_generation:
+            _QUOTE_CACHE[key] = entry
+            del _QUOTE_IN_FLIGHT[key]
+        flight.result = shared_result
+        flight.event.set()
+    return deepcopy(result)
+
+
+def _complete_failed_quote(
+    key: _QuoteCacheKey,
+    flight: _QuoteFlight,
+    exc: BaseException,
+):
+    with _QUOTE_CACHE_LOCK:
+        if _QUOTE_IN_FLIGHT.get(key) is flight:
+            del _QUOTE_IN_FLIGHT[key]
+        flight.error = exc
+        flight.event.set()
+    raise exc
 
 
 def _quote_price(quote: Mapping[str, Any]) -> float:
@@ -424,6 +553,17 @@ def _utc_now() -> datetime:
 
 
 def _clear_valuation_caches() -> None:
-    with _CACHE_LOCK:
-        _MODEL_CACHE.clear()
-        _QUOTE_CACHE.clear()
+    global _MODEL_GENERATION, _QUOTE_GENERATION
+
+    with _MODEL_CACHE_LOCK:
+        with _QUOTE_CACHE_LOCK:
+            _MODEL_CACHE.clear()
+            _QUOTE_CACHE.clear()
+            _MODEL_GENERATION += 1
+            _QUOTE_GENERATION += 1
+            model_flights = tuple(_MODEL_IN_FLIGHT.values())
+            quote_flights = tuple(_QUOTE_IN_FLIGHT.values())
+            _MODEL_IN_FLIGHT.clear()
+            _QUOTE_IN_FLIGHT.clear()
+    for flight in (*model_flights, *quote_flights):
+        flight.event.set()

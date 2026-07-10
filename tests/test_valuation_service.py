@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -197,6 +198,13 @@ def _install_success(
         "get_settings",
         lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
     )
+
+
+def _thread_call(func, results, errors) -> None:
+    try:
+        results.append(func())
+    except BaseException as exc:  # noqa: BLE001 - relay thread failures.
+        errors.append(exc)
 
 
 def test_service_builds_typed_owner_earnings_response(monkeypatch, fake_clock):
@@ -648,3 +656,398 @@ def test_clear_valuation_caches_invalidates_both_layers(monkeypatch, fake_clock)
 
     assert model_calls == 2
     assert quote_calls == 2
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_quote_cache_single_flight_shares_concurrent_miss_or_refresh(
+    monkeypatch, fake_clock, expired
+):
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
+    )
+    if expired:
+        monkeypatch.setattr(
+            valuation_service.tradingview_provider,
+            "get_quote",
+            lambda exchange, symbol: _quote(currency="USD", price=6.0),
+        )
+        valuation_service._get_quote(
+            "NASDAQ", "ACME", "NASDAQ:ACME"
+        )
+        fake_clock.monotonic[0] = 300.0
+
+    owner_started = Event()
+    waiter_waiting = Event()
+    release_owner = Event()
+    duplicate_started = Event()
+    inner_flight_event = Event()
+    calls = 0
+    calls_lock = Lock()
+    results = []
+    errors: list[BaseException] = []
+
+    class TrackingFlightEvent:
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_waiting.set()
+            return inner_flight_event.wait(timeout)
+
+        def set(self) -> None:
+            inner_flight_event.set()
+
+    def blocking_quote(exchange: str, symbol: str):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            owner_started.set()
+            assert release_owner.wait(2), "test did not release quote owner"
+            return _quote(currency="USD", price=6.0)
+        duplicate_started.set()
+        return _quote(currency="USD", price=8.0)
+
+    monkeypatch.setattr(
+        valuation_service, "Event", lambda: TrackingFlightEvent(), raising=False
+    )
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider,
+        "get_quote",
+        blocking_quote,
+    )
+
+    owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "ACME", "NASDAQ:ACME"
+            ),
+            results,
+            errors,
+        ),
+    )
+    waiter = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "acme", "NASDAQ:ACME"
+            ),
+            results,
+            errors,
+        ),
+    )
+    owner.start()
+    assert owner_started.wait(2), "quote owner did not start"
+    waiter.start()
+    waiter_joined_flight = waiter_waiting.wait(0.5)
+    release_owner.set()
+    owner.join(2)
+    waiter.join(2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert waiter_joined_flight is True
+    assert errors == []
+    assert duplicate_started.is_set() is False
+    assert calls == 1
+    assert [result["price"] for result in results] == [6.0, 6.0]
+    assert valuation_service._QUOTE_IN_FLIGHT == {}
+
+
+def test_quote_cache_failure_notifies_waiters_and_releases_flight(
+    monkeypatch, fake_clock
+):
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
+    )
+    owner_started = Event()
+    waiter_waiting = Event()
+    release_owner = Event()
+    inner_flight_event = Event()
+    calls = 0
+    results = []
+    errors: list[BaseException] = []
+
+    class TrackingFlightEvent:
+        def wait(self, timeout: float | None = None) -> bool:
+            waiter_waiting.set()
+            return inner_flight_event.wait(timeout)
+
+        def set(self) -> None:
+            inner_flight_event.set()
+
+    def failing_quote(exchange: str, symbol: str):
+        nonlocal calls
+        calls += 1
+        owner_started.set()
+        assert release_owner.wait(2), "test did not release failing owner"
+        raise TradingViewProviderError("quote failed", status_code=503)
+
+    monkeypatch.setattr(
+        valuation_service, "Event", lambda: TrackingFlightEvent(), raising=False
+    )
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider,
+        "get_quote",
+        failing_quote,
+    )
+
+    owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "ACME", "NASDAQ:ACME"
+            ),
+            results,
+            errors,
+        ),
+    )
+    waiter = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "ACME", "NASDAQ:ACME"
+            ),
+            results,
+            errors,
+        ),
+    )
+    owner.start()
+    assert owner_started.wait(2), "failing quote owner did not start"
+    waiter.start()
+    waiter_joined_flight = waiter_waiting.wait(0.5)
+    release_owner.set()
+    owner.join(2)
+    waiter.join(2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert waiter_joined_flight is True
+    assert results == []
+    assert calls == 1
+    assert len(errors) == 2
+    assert all(
+        isinstance(error, valuation_service.ValuationServiceError)
+        and error.detail == "quote failed"
+        for error in errors
+    )
+    assert valuation_service._QUOTE_IN_FLIGHT == {}
+    assert valuation_service._QUOTE_CACHE == {}
+
+
+def test_clear_during_quote_fetch_prevents_old_generation_repopulation(
+    monkeypatch, fake_clock
+):
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
+    )
+    owner_started = Event()
+    release_owner = Event()
+    results = []
+    errors: list[BaseException] = []
+
+    def blocking_quote(exchange: str, symbol: str):
+        owner_started.set()
+        assert release_owner.wait(2), "test did not release old quote owner"
+        return _quote(currency="USD", price=6.0)
+
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider,
+        "get_quote",
+        blocking_quote,
+    )
+    owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "ACME", "NASDAQ:ACME"
+            ),
+            results,
+            errors,
+        ),
+    )
+    owner.start()
+    assert owner_started.wait(2), "old quote owner did not start"
+
+    valuation_service._clear_valuation_caches()
+    release_owner.set()
+    owner.join(2)
+
+    assert not owner.is_alive()
+    assert errors == []
+    assert results[0]["price"] == 6.0
+    assert valuation_service._QUOTE_CACHE == {}
+    assert valuation_service._QUOTE_IN_FLIGHT == {}
+
+
+def test_post_clear_quote_generation_wins_over_slow_old_owner(
+    monkeypatch, fake_clock
+):
+    monkeypatch.setattr(
+        valuation_service,
+        "get_settings",
+        lambda: SimpleNamespace(valuation_quote_ttl_seconds=300),
+    )
+    old_started = Event()
+    release_old = Event()
+    calls = 0
+    calls_lock = Lock()
+    old_results = []
+    old_errors: list[BaseException] = []
+
+    def ordered_quote(exchange: str, symbol: str):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            old_started.set()
+            assert release_old.wait(2), "test did not release slow old quote"
+            return _quote(currency="USD", price=6.0)
+        if call_number == 2:
+            return _quote(currency="USD", price=8.0)
+        pytest.fail("post-clear quote result was not cached")
+
+    monkeypatch.setattr(
+        valuation_service.tradingview_provider,
+        "get_quote",
+        ordered_quote,
+    )
+    old_owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_quote(
+                "NASDAQ", "ACME", "NASDAQ:ACME"
+            ),
+            old_results,
+            old_errors,
+        ),
+    )
+    old_owner.start()
+    assert old_started.wait(2), "slow old quote did not start"
+
+    valuation_service._clear_valuation_caches()
+    new_result = valuation_service._get_quote(
+        "NASDAQ", "ACME", "NASDAQ:ACME"
+    )
+    release_old.set()
+    old_owner.join(2)
+    cached_result = valuation_service._get_quote(
+        "NASDAQ", "ACME", "NASDAQ:ACME"
+    )
+
+    assert not old_owner.is_alive()
+    assert old_errors == []
+    assert old_results[0]["price"] == 6.0
+    assert new_result["price"] == 8.0
+    assert cached_result["price"] == 8.0
+    assert calls == 2
+    assert valuation_service._QUOTE_IN_FLIGHT == {}
+
+
+def test_clear_during_model_computation_prevents_old_generation_repopulation(
+    monkeypatch, fake_clock
+):
+    fundamentals = _fundamentals()
+    envelope = _envelope(fundamentals)
+    owner_started = Event()
+    release_owner = Event()
+    results = []
+    errors: list[BaseException] = []
+
+    def blocking_model(candidate):
+        owner_started.set()
+        assert release_owner.wait(2), "test did not release old model owner"
+        return _model_result()
+
+    monkeypatch.setattr(valuation_service, "route_valuation", blocking_model)
+    owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_model_result(
+                "NASDAQ:ACME", fundamentals, envelope, NOW
+            ),
+            results,
+            errors,
+        ),
+    )
+    owner.start()
+    assert owner_started.wait(2), "old model owner did not start"
+
+    valuation_service._clear_valuation_caches()
+    release_owner.set()
+    owner.join(2)
+
+    assert not owner.is_alive()
+    assert errors == []
+    assert results[0].base == 7.5
+    assert valuation_service._MODEL_CACHE == {}
+    assert valuation_service._MODEL_IN_FLIGHT == {}
+
+
+def test_post_clear_model_generation_wins_over_slow_old_owner(
+    monkeypatch, fake_clock
+):
+    fundamentals = _fundamentals()
+    envelope = _envelope(fundamentals)
+    old_result = _model_result()
+    new_result = _model_result().model_copy(
+        deep=True,
+        update={"bear": 10.0, "base": 20.0, "bull": 30.0},
+    )
+    old_started = Event()
+    release_old = Event()
+    calls = 0
+    calls_lock = Lock()
+    old_results = []
+    old_errors: list[BaseException] = []
+
+    def ordered_model(candidate):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            old_started.set()
+            assert release_old.wait(2), "test did not release slow old model"
+            return old_result
+        if call_number == 2:
+            return new_result
+        pytest.fail("post-clear model result was not cached")
+
+    monkeypatch.setattr(valuation_service, "route_valuation", ordered_model)
+    old_owner = Thread(
+        target=_thread_call,
+        args=(
+            lambda: valuation_service._get_model_result(
+                "NASDAQ:ACME", fundamentals, envelope, NOW
+            ),
+            old_results,
+            old_errors,
+        ),
+    )
+    old_owner.start()
+    assert old_started.wait(2), "slow old model did not start"
+
+    valuation_service._clear_valuation_caches()
+    post_clear = valuation_service._get_model_result(
+        "NASDAQ:ACME", fundamentals, envelope, NOW
+    )
+    release_old.set()
+    old_owner.join(2)
+    cached = valuation_service._get_model_result(
+        "NASDAQ:ACME", fundamentals, envelope, NOW
+    )
+
+    assert not old_owner.is_alive()
+    assert old_errors == []
+    assert old_results[0].base == 7.5
+    assert post_clear.base == 20.0
+    assert cached.base == 20.0
+    assert calls == 2
+    assert valuation_service._MODEL_IN_FLIGHT == {}
