@@ -37,7 +37,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /api/v1/sentiment/{symbol}`
 - `GET /api/v1/news`
 
-Legacy stock compatibility is limited to the quote and technical-analysis GET routes. New clients should use the canonical market `/analysis` and `/technical` routes directly; the retained aliases are:
+Legacy stock compatibility is limited to the quote and technical-analysis GET routes. New clients should use the canonical market `/quote` and `/technical` routes directly; the retained aliases are:
 
 - `GET /api/v1/stocks/{symbol}/quote`
 - `GET /api/v1/stocks/{symbol}/technicals`
