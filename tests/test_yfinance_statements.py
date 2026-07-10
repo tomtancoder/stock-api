@@ -141,7 +141,7 @@ def test_normalizes_reviewed_statement_aliases(
 
 
 @pytest.mark.parametrize("row_alias", ["Interest Paid Supplemental", "Interest Paid"])
-def test_interest_alias_is_used_only_when_metadata_classifies_it_outside_cfo(
+def test_financing_interest_metadata_records_zero_add_back(
     monkeypatch: pytest.MonkeyPatch, row_alias: str
 ) -> None:
     ticker = FakeTicker(
@@ -155,9 +155,10 @@ def test_interest_alias_is_used_only_when_metadata_classifies_it_outside_cfo(
 
     period = fetch_yfinance_fundamentals("SGX", "D05").periods[0]
 
-    assert period.interest_paid_outside_operating == -17.0
+    assert period.interest_paid_outside_operating == 0.0
     assert (
-        period.sources["interest_paid_outside_operating"].concept == row_alias
+        period.sources["interest_paid_outside_operating"].concept
+        == "outside_operating_cash_flow"
     )
 
 
@@ -179,13 +180,17 @@ def test_interest_stays_missing_when_classification_is_unknown(
     assert "interest_paid_outside_operating" not in period.sources
 
 
-def test_operating_interest_metadata_records_resolved_zero(
+def test_operating_interest_metadata_preserves_actual_interest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ticker = FakeTicker(
         cashflow={
             "yearly": statement(
-                {"Operating Cash Flow": 100.0}, "2025-12-31"
+                {
+                    "Operating Cash Flow": 100.0,
+                    "Interest Paid": -17.0,
+                },
+                "2025-12-31",
             )
         },
         info={
@@ -197,10 +202,41 @@ def test_operating_interest_metadata_records_resolved_zero(
 
     period = fetch_yfinance_fundamentals("SGX", "D05").periods[0]
 
-    assert period.interest_paid_outside_operating == 0.0
+    assert period.interest_paid_outside_operating == -17.0
     assert (
         period.sources["interest_paid_outside_operating"].concept
-        == "included_in_operating_cash_flow"
+        == "Interest Paid"
+    )
+
+
+def test_interest_classification_is_specific_to_statement_frequency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annual = statement({"Interest Paid": -11.0}, "2025-12-31")
+    annual.attrs["interestPaidClassification"] = "operating"
+    trailing = statement({"Interest Paid": -13.0}, "2026-06-30")
+    trailing.attrs["interestPaidClassification"] = "financing"
+    ticker = FakeTicker(
+        cashflow={"yearly": annual, "trailing": trailing},
+        info={
+            "financialCurrency": "SGD",
+            "interestPaidClassification": "financing",
+        },
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "D05")
+
+    annual_period, trailing_period = result.periods
+    assert annual_period.interest_paid_outside_operating == -11.0
+    assert (
+        annual_period.sources["interest_paid_outside_operating"].concept
+        == "Interest Paid"
+    )
+    assert trailing_period.interest_paid_outside_operating == 0.0
+    assert (
+        trailing_period.sources["interest_paid_outside_operating"].concept
+        == "outside_operating_cash_flow"
     )
 
 
@@ -351,6 +387,61 @@ def test_four_quarters_create_ttm_when_direct_trailing_statements_are_absent(
     assert ttm.stock_based_compensation == 10.0
     assert ttm.revenue == 1_000.0
     assert ttm.total_assets == 900.0
+
+
+def test_quarterly_ttm_diluted_shares_uses_latest_value_without_summing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarters = ("2025-09-30", "2025-06-30", "2025-03-31", "2024-12-31")
+    ticker = FakeTicker(
+        income={
+            "quarterly": statement(
+                {"Diluted Average Shares": [100.0, 100.0, 100.0, 100.0]},
+                *quarters,
+            )
+        }
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "D05")
+
+    assert len(result.periods) == 1
+    ttm = result.periods[0]
+    assert ttm.is_ttm is True
+    assert ttm.diluted_shares == 100.0
+    assert ttm.sources["diluted_shares"].period_end == ttm.period_end
+
+
+def test_newer_quarters_replace_stale_direct_ttm_with_coherent_period_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarters = ("2025-09-30", "2025-06-30", "2025-03-31", "2024-12-31")
+    ticker = FakeTicker(
+        cashflow={
+            "quarterly": statement(
+                {"Operating Cash Flow": [40.0, 30.0, 20.0, 10.0]},
+                *quarters,
+            )
+        },
+        income={
+            "trailing": statement({"Revenue": 600.0}, "2025-06-30"),
+            "quarterly": statement(
+                {"Revenue": [400.0, 300.0, 200.0, 100.0]},
+                *quarters,
+            ),
+        },
+    )
+    install_ticker(monkeypatch, ticker)
+
+    result = fetch_yfinance_fundamentals("SGX", "D05")
+
+    assert len(result.periods) == 1
+    ttm = result.periods[0]
+    assert ttm.period_end.isoformat() == "2025-09-30"
+    assert ttm.operating_cash_flow == 100.0
+    assert ttm.revenue == 1_000.0
+    assert ttm.sources["operating_cash_flow"].period_end == ttm.period_end
+    assert ttm.sources["revenue"].period_end == ttm.period_end
 
 
 def test_non_finite_values_remain_missing(monkeypatch: pytest.MonkeyPatch) -> None:

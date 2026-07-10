@@ -79,10 +79,10 @@ _FIELD_ALIASES: dict[str, tuple[StatementKind, tuple[str, ...]]] = {
 }
 
 _INTEREST_ALIASES = ("Interest Paid Supplemental", "Interest Paid")
-_FLOW_FIELDS = {
+_ADDITIVE_FIELDS = {
     field
     for field, (kind, _aliases) in _FIELD_ALIASES.items()
-    if kind in {"cashflow", "income"}
+    if kind == "cashflow" or field in {"revenue", "net_income_common"}
 }
 _FACT_FIELDS = (*_FIELD_ALIASES, "interest_paid_outside_operating")
 _CLASSIFICATION_KEYS = (
@@ -120,16 +120,15 @@ def fetch_yfinance_fundamentals(
         ) from exc
 
     valid_frames = _currency_consistent_frames(frames, currency, warnings)
-    interest_classification = _interest_classification(info, valid_frames)
     annual_periods = _build_annual_periods(
         valid_frames,
         currency,
-        interest_classification,
+        info,
     )
     trailing_period = _build_trailing_period(
         valid_frames,
         currency,
-        interest_classification,
+        info,
     )
     periods = sorted(
         [*annual_periods, *([trailing_period] if trailing_period else [])],
@@ -285,18 +284,13 @@ def _frame_currency(frame: pd.DataFrame) -> str | None:
 
 
 def _interest_classification(
-    info: Mapping[str, Any],
-    frames: Mapping[tuple[StatementKind, str], pd.DataFrame],
+    period_end: date,
+    *metadata_sources: Mapping[str, Any],
 ) -> Literal["inside", "outside"] | None:
-    metadata: list[Mapping[str, Any]] = [info]
-    metadata.extend(
-        frame.attrs
-        for (kind, _frequency), frame in frames.items()
-        if kind == "cashflow"
-    )
-    for source in metadata:
+    for source in metadata_sources:
         outside = _metadata_boolean(
             source,
+            period_end,
             "interestPaidOutsideOperatingCashFlow",
             "interest_paid_outside_operating_cash_flow",
         )
@@ -304,6 +298,7 @@ def _interest_classification(
             return "outside" if outside else "inside"
         inside = _metadata_boolean(
             source,
+            period_end,
             "interestPaidIncludedInOperatingCashFlow",
             "interest_paid_in_operating_cash_flow",
             "interest_included_in_operating_cash_flow",
@@ -311,7 +306,7 @@ def _interest_classification(
         if inside is not None:
             return "inside" if inside else "outside"
         for key in _CLASSIFICATION_KEYS:
-            value = _text(source.get(key))
+            value = _text(_metadata_value(source, key, period_end))
             if not value:
                 continue
             normalized = value.casefold().replace("_", " ").replace("-", " ")
@@ -322,18 +317,33 @@ def _interest_classification(
     return None
 
 
-def _metadata_boolean(source: Mapping[str, Any], *keys: str) -> bool | None:
+def _metadata_boolean(
+    source: Mapping[str, Any], period_end: date, *keys: str
+) -> bool | None:
     for key in keys:
-        value = source.get(key)
+        value = _metadata_value(source, key, period_end)
         if isinstance(value, bool):
             return value
+    return None
+
+
+def _metadata_value(
+    source: Mapping[str, Any], key: str, period_end: date
+) -> Any:
+    value = source.get(key)
+    if not isinstance(value, Mapping):
+        return value
+    for raw_period, period_value in value.items():
+        timestamp = _timestamp(raw_period)
+        if timestamp is not None and timestamp.date() == period_end:
+            return period_value
     return None
 
 
 def _build_annual_periods(
     frames: Mapping[tuple[StatementKind, str], pd.DataFrame],
     currency: str,
-    interest_classification: Literal["inside", "outside"] | None,
+    info: Mapping[str, Any],
 ) -> list[FinancialPeriod]:
     yearly = {
         kind: frames[(kind, "yearly")]
@@ -351,7 +361,11 @@ def _build_annual_periods(
             period_end,
             currency,
             yearly,
-            interest_classification,
+            _interest_classification(
+                period_end,
+                yearly["cashflow"].attrs,
+                info,
+            ),
             is_ttm=False,
             form="yearly",
         )
@@ -362,7 +376,7 @@ def _build_annual_periods(
 def _build_trailing_period(
     frames: Mapping[tuple[StatementKind, str], pd.DataFrame],
     currency: str,
-    interest_classification: Literal["inside", "outside"] | None,
+    info: Mapping[str, Any],
 ) -> FinancialPeriod | None:
     trailing = {
         kind: frames[(kind, "trailing")]
@@ -384,19 +398,39 @@ def _build_trailing_period(
             for period_end in _selected_columns(frame)
         }
     )
-    if not direct_dates and len(quarter_dates) < 4:
+    direct_period_end = max(direct_dates) if direct_dates else None
+    quarterly_period_end = quarter_dates[-1] if len(quarter_dates) >= 4 else None
+    if direct_period_end is None and quarterly_period_end is None:
         return None
 
-    period_end = max(direct_dates or set(quarter_dates))
+    use_direct = direct_period_end is not None and (
+        quarterly_period_end is None or direct_period_end >= quarterly_period_end
+    )
+    period_end = direct_period_end if use_direct else quarterly_period_end
+    assert period_end is not None
+    base_frames = (
+        trailing
+        if use_direct
+        else {kind: pd.DataFrame() for kind in ("cashflow", "income", "balance")}
+    )
+    direct_interest_classification = (
+        _interest_classification(
+            period_end,
+            trailing["cashflow"].attrs,
+            info,
+        )
+        if use_direct
+        else None
+    )
     direct = _build_period(
         period_end,
         currency,
-        trailing,
-        interest_classification,
+        base_frames,
+        direct_interest_classification,
         is_ttm=True,
         form="trailing",
     )
-    if len(quarter_dates) < 4:
+    if quarterly_period_end != period_end:
         return direct
 
     latest_quarters = quarter_dates[-4:]
@@ -405,7 +439,7 @@ def _build_trailing_period(
     for field, (kind, aliases) in _FIELD_ALIASES.items():
         if getattr(direct, field) is not None:
             continue
-        if field in _FLOW_FIELDS:
+        if field in _ADDITIVE_FIELDS:
             extracted = _sum_quarters(quarterly[kind], latest_quarters, aliases)
         else:
             extracted = _extract_value(quarterly[kind], period_end, aliases)
@@ -421,10 +455,15 @@ def _build_trailing_period(
         )
 
     if direct.interest_paid_outside_operating is None:
+        quarterly_interest_classification = _interest_classification(
+            latest_quarters[-1],
+            quarterly["cashflow"].attrs,
+            info,
+        )
         interest = _quarterly_interest(
             quarterly["cashflow"],
             latest_quarters,
-            interest_classification,
+            quarterly_interest_classification,
         )
         if interest is not None:
             value, concept = interest
@@ -484,9 +523,9 @@ def _period_interest(
     classification: Literal["inside", "outside"] | None,
 ) -> tuple[float, str] | None:
     if classification == "inside":
-        return 0.0, "included_in_operating_cash_flow"
-    if classification == "outside":
         return _extract_value(frame, period_end, _INTEREST_ALIASES)
+    if classification == "outside":
+        return 0.0, "outside_operating_cash_flow"
     return None
 
 
@@ -496,9 +535,9 @@ def _quarterly_interest(
     classification: Literal["inside", "outside"] | None,
 ) -> tuple[float, str] | None:
     if classification == "inside":
-        return 0.0, "included_in_operating_cash_flow"
-    if classification == "outside":
         return _sum_quarters(frame, period_ends, _INTEREST_ALIASES)
+    if classification == "outside":
+        return 0.0, "outside_operating_cash_flow"
     return None
 
 
