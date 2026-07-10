@@ -84,12 +84,17 @@ def classify_company(
             reasons=("REIT valuation is recognized but not supported yet.",),
         )
 
-    bank_metadata = tuple(
-        item
-        for item in metadata
-        if item[0] in {"industry", "issuer_classification"}
+    bank_industry_sources = _matching_sources(
+        tuple(item for item in metadata if item[0] == "industry"),
+        _BANK_TERMS,
     )
-    bank_sources = _matching_sources(bank_metadata, _BANK_TERMS)
+    bank_issuer_sources = _matching_sources(
+        tuple(
+            item for item in metadata if item[0] == "issuer_classification"
+        ),
+        _BANK_TERMS,
+    )
+    bank_sources = _unique((*bank_industry_sources, *bank_issuer_sources))
     insurance_sources = _matching_sources(metadata, _INSURANCE_TERMS)
     ordinary_conflict_sources = _ordinary_conflict_sources(metadata)
 
@@ -117,6 +122,16 @@ def classify_company(
                 supported=False,
                 sources=_unique((*ordinary_conflict_sources, *bank_sources)),
                 reasons=("Bank and operating-company metadata conflict.",),
+            )
+        if not bank_industry_sources:
+            return CompanyClassification(
+                company_type="ambiguous",
+                supported=False,
+                sources=_unique((*bank_sources, "statement_structure")),
+                reasons=(
+                    "Bank issuer metadata lacks an explicit bank industry "
+                    "classification.",
+                ),
             )
         if not bank_statements:
             return CompanyClassification(
@@ -204,6 +219,11 @@ def _ordinary_conflict_sources(
     for source, value in metadata:
         if source == "sector" and not any(
             term in value for term in (*_BROAD_FINANCIAL_SECTORS, "real estate")
+        ):
+            sources.append(source)
+        elif source in {"industry", "issuer_classification"} and not any(
+            term in value
+            for term in (*_REIT_TERMS, *_BANK_TERMS, *_INSURANCE_TERMS)
         ):
             sources.append(source)
     return _unique(sources)

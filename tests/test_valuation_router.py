@@ -187,6 +187,106 @@ def test_bank_industry_detection_does_not_depend_on_other_metadata_fields():
     assert classification.sources == ("industry", "statement_structure")
 
 
+def test_bank_issuer_classification_cannot_substitute_for_missing_industry(
+    monkeypatch,
+):
+    fundamentals = _fundamentals(
+        sector="Financial Services",
+        industry=None,
+        issuer_classification="Commercial Banking",
+        periods=[_bank_period(year) for year in range(2022, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("issuer-only bank must not be valued"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail("issuer-only bank must not fall back"),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+
+    assert classification.company_type == "ambiguous"
+    assert classification.supported is False
+    assert "issuer_classification" in classification.sources
+    assert any(
+        "industry" in reason.lower() for reason in classification.reasons
+    )
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(fundamentals)
+
+
+def test_bank_issuer_classification_conflicts_with_ordinary_industry(
+    monkeypatch,
+):
+    fundamentals = _fundamentals(
+        sector="Financial Services",
+        industry="Software",
+        issuer_classification="Commercial Banking",
+        periods=[_bank_period(year) for year in range(2022, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("conflicting issuer must not use bank"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail(
+            "conflicting issuer must not use owner earnings"
+        ),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+
+    assert classification.company_type == "ambiguous"
+    assert classification.supported is False
+    assert set(classification.sources) >= {"industry", "issuer_classification"}
+    assert any(
+        "conflict" in reason.lower() for reason in classification.reasons
+    )
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(fundamentals)
+
+
+def test_bank_industry_conflicts_with_ordinary_issuer_classification(
+    monkeypatch,
+):
+    fundamentals = _fundamentals(
+        sector="Financial Services",
+        industry="Banks - Regional",
+        issuer_classification="Software Company",
+        periods=[_bank_period(year) for year in range(2022, 2026)],
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("conflicting industry must not use bank"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail(
+            "conflicting industry must not use owner earnings"
+        ),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+
+    assert classification.company_type == "ambiguous"
+    assert classification.supported is False
+    assert set(classification.sources) >= {"industry", "issuer_classification"}
+    assert any(
+        "conflict" in reason.lower() for reason in classification.reasons
+    )
+    with pytest.raises(valuation_router.ValuationUnreliable):
+        valuation_router.route_valuation(fundamentals)
+
+
 def test_bank_classification_rejects_incompatible_common_equity_units(
     monkeypatch,
 ):
