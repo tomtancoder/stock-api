@@ -4,7 +4,7 @@ import math
 import os
 from typing import Any, Callable
 
-from app.services.market_symbols import to_public_symbol, to_yahoo_symbol
+from app.services.market_symbols import to_yahoo_symbol
 from app.services.yfinance_analysis import get_analysis as get_yfinance_analysis
 
 

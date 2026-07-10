@@ -28,7 +28,6 @@ def to_public_symbol(exchange: str, symbol: str) -> str:
     if venue in {"TVC", "CAPITALCOM"} and normalized in {
         "GOLD",
         "TVC:GOLD",
-        "GC=F",
     }:
         normalized = "XAUUSD"
     return f"{venue}:{normalized}"
