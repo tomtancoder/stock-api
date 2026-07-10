@@ -98,6 +98,30 @@ def _bank_period(year: int) -> FinancialPeriod:
     )
 
 
+def _reit_period(year: int) -> FinancialPeriod:
+    return _period(
+        year,
+        currency="SGD",
+        distribution_per_unit=0.06,
+        nav_per_unit=1.10,
+    )
+
+
+def _reit_fundamentals() -> ValuationFundamentals:
+    return _fundamentals(
+        provider_security_type="REIT",
+        sector="Financial Services",
+        industry="REIT - Retail",
+        currency="SGD",
+        periods=[_reit_period(year) for year in range(2023, 2026)],
+    ).model_copy(
+        update={
+            "symbol": "SGX:C38U",
+            "exchange": "SGX",
+        }
+    )
+
+
 def test_operating_company_classifies_and_routes_to_owner_earnings(monkeypatch):
     fundamentals = _operating_company()
     expected = ModelResult(
@@ -386,10 +410,54 @@ def test_explicit_reit_type_takes_precedence_over_bank_evidence(monkeypatch):
     classification = valuation_router.classify_company(fundamentals)
 
     assert classification.company_type == "reit"
-    assert classification.supported is False
+    assert classification.supported is True
     assert classification.sources[0] == "provider_security_type"
     with pytest.raises(valuation_router.ValuationUnreliable):
         valuation_router.route_valuation(fundamentals)
+
+
+def test_supported_reit_takes_precedence_and_routes_only_to_reit_engine(
+    monkeypatch,
+):
+    fundamentals = _reit_fundamentals()
+    expected = ModelResult(
+        method="reit_distribution_nav",
+        detected_company_type="reit",
+        bear=0.8,
+        base=1.0,
+        bull=1.2,
+        details={},
+        assumptions={},
+        quality={"eligible": True, "reasons": []},
+    )
+    calls: list[ValuationFundamentals] = []
+
+    def fake_value(candidate: ValuationFundamentals) -> ModelResult:
+        calls.append(candidate)
+        return expected
+
+    monkeypatch.setattr(
+        valuation_router, "value_reit", fake_value, raising=False
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_bank",
+        lambda candidate: pytest.fail("REIT must not use bank valuation"),
+    )
+    monkeypatch.setattr(
+        valuation_router,
+        "value_owner_earnings",
+        lambda candidate: pytest.fail("REIT must not use owner earnings"),
+    )
+
+    classification = valuation_router.classify_company(fundamentals)
+    result = valuation_router.route_valuation(fundamentals)
+
+    assert classification.company_type == "reit"
+    assert classification.supported is True
+    assert classification.sources[0] == "provider_security_type"
+    assert result == expected
+    assert calls == [fundamentals]
 
 
 def test_explicit_unsupported_type_precedes_reit_industry_metadata(monkeypatch):

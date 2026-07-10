@@ -113,8 +113,23 @@ class BankValuationDetails(BaseModel):
     loan_loss_coverage: float | None = None
 
 
+class ReitValuationDetails(BaseModel):
+    method: Literal["reit_distribution_nav", "reit_distribution_only"]
+    normalized_dpu: float
+    nav_per_unit: float | None
+    price_to_nav: float | None
+    distribution_yield: float
+    usable_years: int
+    present_value_distributions: dict[str, float]
+    present_value_terminal: dict[str, float]
+    aggregate_leverage: float | None = None
+    interest_coverage: float | None = None
+    occupancy: float | None = None
+    wale_years: float | None = None
+
+
 ValuationModelDetails = Annotated[
-    OwnerEarningsValuationDetails | BankValuationDetails,
+    OwnerEarningsValuationDetails | BankValuationDetails | ReitValuationDetails,
     Field(discriminator="method"),
 ]
 

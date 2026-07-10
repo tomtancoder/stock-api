@@ -117,6 +117,63 @@ def _bank_valuation_response_payload():
     return payload
 
 
+def _reit_valuation_response_payload(*, distribution_only: bool = False):
+    payload = _valuation_response_payload()
+    payload.update(
+        {
+            "symbol": "SGX:C38U",
+            "detected_company_type": "reit",
+            "method": (
+                "reit_distribution_only"
+                if distribution_only
+                else "reit_distribution_nav"
+            ),
+            "confidence": "low" if distribution_only else "medium",
+            "current_price": 0.93,
+            "intrinsic_value": {
+                "bear": 0.80,
+                "base": 1.00,
+                "bull": 1.20,
+                "margin_of_safety_price": 0.75,
+                "price_to_base_value": 0.93,
+                "upside_downside_percent": 7.5269,
+            },
+            "model_details": {
+                "method": (
+                    "reit_distribution_only"
+                    if distribution_only
+                    else "reit_distribution_nav"
+                ),
+                "normalized_dpu": 0.061,
+                "nav_per_unit": None if distribution_only else 1.11,
+                "price_to_nav": None,
+                "distribution_yield": 0.0656,
+                "usable_years": 4,
+                "present_value_distributions": {
+                    "bear": 0.31,
+                    "base": 0.38,
+                    "bull": 0.47,
+                },
+                "present_value_terminal": {
+                    "bear": 0.49,
+                    "base": 0.62,
+                    "bull": 0.73,
+                },
+                "aggregate_leverage": 0.34,
+                "interest_coverage": 3.2,
+                "occupancy": 0.98,
+                "wale_years": 4.1,
+            },
+            "sources": {
+                "distribution_per_unit": "yfinance_dividends",
+                "nav_per_unit": "yfinance_balance_sheet",
+                "current_price": "existing_quote_provider",
+            },
+        }
+    )
+    return payload
+
+
 def test_health():
     response = client.get("/health")
 
@@ -242,6 +299,36 @@ def test_market_bank_valuation_normalizes_both_d05_forms_and_stays_independent(
     assert technical.status_code == 200
     assert technical.json()["source"] == "tradingview_mcp"
     assert technical_calls == [("SGX", "D05", "1D", False)]
+
+
+def test_market_reit_valuation_accepts_sgx_forms_and_returns_typed_details(
+    monkeypatch,
+):
+    from app.api.v1 import markets
+
+    calls = []
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: calls.append((exchange, symbol))
+        or _reit_valuation_response_payload(),
+    )
+
+    bare = client.get("/api/v1/markets/SGX/C38U/valuation")
+    suffixed = client.get("/api/v1/markets/SGX/C38U.SI/valuation")
+
+    assert bare.status_code == 200
+    assert suffixed.status_code == 200
+    assert bare.json() == suffixed.json()
+    payload = bare.json()
+    assert payload["symbol"] == "SGX:C38U"
+    assert payload["currency"] == "SGD"
+    assert payload["method"] == "reit_distribution_nav"
+    assert payload["confidence"] == "medium"
+    assert payload["model_details"]["method"] == "reit_distribution_nav"
+    assert payload["model_details"]["normalized_dpu"] == 0.061
+    assert payload["sources"]["distribution_per_unit"] == "yfinance_dividends"
+    assert calls == [("SGX", "C38U"), ("SGX", "C38U.SI")]
 
 
 def test_market_valuation_endpoint_maps_not_found_service_error(monkeypatch):

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.schemas import BankValuationDetails
+from app.schemas import BankValuationDetails, ReitValuationDetails
 from app.services import bank_valuation, valuation_router, valuation_service
 from app.services.sec_companyfacts import SecCompanyFactsError
 from app.services.tradingview_provider import TradingViewProviderError
@@ -144,6 +144,57 @@ def _bank_fundamentals() -> ValuationFundamentals:
             "regulatory_capital_headroom": "yfinance_info",
         },
         warnings=["bank fundamentals warning"],
+    )
+
+
+def _reit_fundamentals(*, include_nav: bool = True) -> ValuationFundamentals:
+    periods = []
+    for index, dpu in enumerate((0.055, 0.058, 0.061, 0.063)):
+        year = 2022 + index
+        period_end = date(year, 12, 31)
+        facts = {
+            "distribution_per_unit": dpu,
+            "nav_per_unit": 1.05 + (index * 0.02) if include_nav else None,
+        }
+        periods.append(
+            FinancialPeriod(
+                period_end=period_end,
+                fiscal_year=year,
+                currency="SGD",
+                sources={
+                    field: FactProvenance(
+                        provider="yfinance",
+                        concept=field,
+                        period_end=period_end,
+                        unit="SGD",
+                    )
+                    for field, value in facts.items()
+                    if value is not None
+                },
+                **facts,
+            )
+        )
+    return ValuationFundamentals(
+        symbol="SGX:C38U",
+        exchange="SGX",
+        currency="SGD",
+        primary_source="yfinance_sgx",
+        provider_security_type="REIT",
+        sector="Real Estate",
+        industry="REIT - Industrial",
+        current_diluted_shares=1_000_000.0,
+        reit_metrics={
+            "aggregate_leverage": 0.34,
+            "interest_coverage": 3.2,
+            "occupancy": 0.98,
+            "wale_years": 4.1,
+        },
+        periods=periods,
+        fetched_at=FETCHED_AT,
+        sources={
+            "distribution_per_unit": "yfinance_dividends",
+            "nav_per_unit": "yfinance_balance_sheet",
+        },
     )
 
 
@@ -440,8 +491,100 @@ def test_service_normalizes_both_d05_forms_to_typed_bank_response(
     assert bank_calls == [fundamentals]
 
 
-def test_bank_model_uses_cache_version_two():
-    assert valuation_service.VALUATION_MODEL_VERSION == "2"
+def test_service_returns_typed_sgx_reit_distribution_nav_response(
+    monkeypatch, fake_clock
+):
+    fundamentals = _reit_fundamentals()
+    _install_success(
+        monkeypatch,
+        envelope=_envelope(fundamentals),
+        classification=_classification("reit"),
+        quote=_quote(price=0.93, currency="SGD"),
+    )
+    monkeypatch.setattr(
+        valuation_service,
+        "route_valuation",
+        valuation_router.route_valuation,
+    )
+
+    response = valuation_service.get_valuation("SGX", "C38U.SI")
+
+    assert response.symbol == "SGX:C38U"
+    assert response.currency == "SGD"
+    assert response.detected_company_type == "reit"
+    assert response.method == "reit_distribution_nav"
+    assert response.confidence == "medium"
+    assert response.intrinsic_value is not None
+    values = (
+        response.intrinsic_value.bear,
+        response.intrinsic_value.base,
+        response.intrinsic_value.bull,
+    )
+    assert all(math.isfinite(value) and value > 0 for value in values)
+    assert values[0] <= values[1] <= values[2]
+    assert isinstance(response.model_details, ReitValuationDetails)
+    assert response.model_details.nav_per_unit == pytest.approx(1.11)
+    assert response.model_details.price_to_nav == pytest.approx(0.93 / 1.11)
+    assert response.model_details.distribution_yield == pytest.approx(
+        response.model_details.normalized_dpu / 0.93
+    )
+    assert response.model_details.aggregate_leverage == pytest.approx(0.34)
+    assert response.sources["distribution_per_unit"] == "yfinance"
+
+
+def test_service_reit_without_nav_returns_low_confidence_distribution_only(
+    monkeypatch, fake_clock
+):
+    fundamentals = _reit_fundamentals(include_nav=False)
+    _install_success(
+        monkeypatch,
+        envelope=_envelope(fundamentals),
+        classification=_classification("reit"),
+        quote=_quote(price=0.93, currency="SGD"),
+    )
+    monkeypatch.setattr(
+        valuation_service,
+        "route_valuation",
+        valuation_router.route_valuation,
+    )
+
+    response = valuation_service.get_valuation("SGX", "C38U")
+
+    assert response.method == "reit_distribution_only"
+    assert response.confidence == "low"
+    assert isinstance(response.model_details, ReitValuationDetails)
+    assert response.model_details.nav_per_unit is None
+
+
+def test_service_reit_with_incomplete_dpu_is_unreliable_without_fallback(
+    monkeypatch, fake_clock
+):
+    fundamentals = _reit_fundamentals().model_copy(
+        update={"periods": _reit_fundamentals().periods[:2]}, deep=True
+    )
+    _install_success(
+        monkeypatch,
+        envelope=_envelope(fundamentals),
+        classification=_classification("reit"),
+        quote=_quote(price=0.93, currency="SGD"),
+    )
+    monkeypatch.setattr(
+        valuation_service,
+        "route_valuation",
+        valuation_router.route_valuation,
+    )
+
+    response = valuation_service.get_valuation("SGX", "C38U")
+
+    assert response.status == "valuation_unreliable"
+    assert response.method is None
+    assert response.intrinsic_value is None
+    assert response.model_details is None
+    assert any("three usable DPU years" in reason for reason in response.quality.reasons)
+
+
+def test_reit_model_uses_cache_version_three():
+    assert valuation_service.VALUATION_MODEL_VERSION == "3"
 
 
 @pytest.mark.parametrize(
@@ -779,7 +922,7 @@ def test_fundamentals_timestamp_and_model_version_only_invalidate_model_cache(
     first_key = next(iter(valuation_service._MODEL_CACHE))
     assert first_key == (
         "NASDAQ:ACME",
-        "2",
+        "3",
         FETCHED_AT.isoformat(),
     )
     changed = first_fundamentals.model_copy(
@@ -791,16 +934,16 @@ def test_fundamentals_timestamp_and_model_version_only_invalidate_model_cache(
     changed_key = next(iter(valuation_service._MODEL_CACHE))
     assert changed_key == (
         "NASDAQ:ACME",
-        "2",
+        "3",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
-    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "3")
+    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "4")
     valuation_service.get_valuation("NASDAQ", "ACME")
     assert len(valuation_service._MODEL_CACHE) == 1
     version_key = next(iter(valuation_service._MODEL_CACHE))
     assert version_key == (
         "NASDAQ:ACME",
-        "3",
+        "4",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
     assert valuation_service._MODEL_CURRENT_KEYS == {
@@ -1274,7 +1417,7 @@ def test_repeated_fundamentals_changes_keep_one_model_entry_per_identity(
 
         expected_key = (
             "NASDAQ:ACME",
-            "2",
+            "3",
             fetched_at.isoformat(),
         )
         assert list(valuation_service._MODEL_CACHE) == [expected_key]
@@ -1388,7 +1531,7 @@ def test_slow_old_model_sibling_cannot_replace_newer_current_key(
 
     newer_key = (
         "NASDAQ:ACME",
-        "2",
+        "3",
         (FETCHED_AT + timedelta(seconds=1)).isoformat(),
     )
     assert not old_owner.is_alive()
@@ -1444,7 +1587,7 @@ def test_older_fundamentals_request_is_non_promoting_after_newer_cache(
     )
     newer_key = (
         "NASDAQ:ACME",
-        "2",
+        "3",
         newer_fetched_at.isoformat(),
     )
     old_caller = Thread(
@@ -1491,6 +1634,7 @@ def test_older_fundamentals_request_is_non_promoting_after_newer_cache(
 def test_old_model_version_completion_is_non_promoting(
     monkeypatch, fake_clock
 ):
+    monkeypatch.setattr(valuation_service, "VALUATION_MODEL_VERSION", "2")
     fundamentals = _fundamentals()
     old_result = _model_result()
     new_result = _model_result().model_copy(

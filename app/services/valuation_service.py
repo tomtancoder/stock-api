@@ -28,7 +28,7 @@ from app.services.valuation_types import ModelResult, ValuationFundamentals
 from app.services.yfinance_statements import YFinanceStatementsError
 
 
-VALUATION_MODEL_VERSION = "2"
+VALUATION_MODEL_VERSION = "3"
 
 
 class ValuationServiceError(RuntimeError):
@@ -206,7 +206,7 @@ def get_valuation(exchange: str, symbol: str) -> ValuationResponse:
                 price_classification.upside_downside_percent
             ),
         },
-        model_details=deepcopy(model_result.details),
+        model_details=_public_model_details(model_result, current_price),
         quality=deepcopy(model_result.quality),
         assumptions=deepcopy(model_result.assumptions),
     )
@@ -575,6 +575,34 @@ def _confidence(
     ):
         return "high"
     return "medium"
+
+
+def _public_model_details(
+    result: ModelResult, current_price: float
+) -> dict[str, object]:
+    details = deepcopy(result.details)
+    if result.method not in {
+        "reit_distribution_nav",
+        "reit_distribution_only",
+    }:
+        return details
+
+    normalized_dpu = details.get("normalized_dpu")
+    if isinstance(normalized_dpu, (int, float)) and math.isfinite(
+        float(normalized_dpu)
+    ):
+        details["distribution_yield"] = float(normalized_dpu) / current_price
+
+    nav_per_unit = details.get("nav_per_unit")
+    if (
+        isinstance(nav_per_unit, (int, float))
+        and math.isfinite(float(nav_per_unit))
+        and float(nav_per_unit) > 0
+    ):
+        details["price_to_nav"] = current_price / float(nav_per_unit)
+    else:
+        details["price_to_nav"] = None
+    return details
 
 
 def _financials_as_of(fundamentals: ValuationFundamentals):

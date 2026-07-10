@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from app.services.bank_valuation import value_bank
 from app.services.owner_earnings_valuation import value_owner_earnings
+from app.services.reit_valuation import value_reit
 from app.services.valuation_types import (
     FinancialPeriod,
     ModelResult,
@@ -79,9 +80,9 @@ def classify_company(
     if reit_sources:
         return CompanyClassification(
             company_type="reit",
-            supported=False,
+            supported=True,
             sources=reit_sources,
-            reasons=("REIT valuation is recognized but not supported yet.",),
+            reasons=(),
         )
 
     bank_industry_sources = _matching_sources(
@@ -177,6 +178,8 @@ def route_valuation(fundamentals: ValuationFundamentals) -> ModelResult:
     if not classification.supported:
         raise ValuationUnreliable(classification.reasons)
     try:
+        if classification.company_type == "reit":
+            return value_reit(fundamentals)
         if classification.company_type == "bank":
             return value_bank(fundamentals)
         if classification.company_type == "operating_company":
