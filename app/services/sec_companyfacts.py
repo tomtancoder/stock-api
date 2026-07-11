@@ -149,6 +149,14 @@ _ADDITIVE_FIELDS = frozenset(
         "gain_on_property_sales",
     }
 )
+_OWNER_EARNINGS_TTM_FIELDS = frozenset(
+    {
+        "operating_cash_flow",
+        "capital_expenditure",
+        "stock_based_compensation",
+        "revenue",
+    }
+)
 _FACT_FIELDS = tuple(_CONCEPTS)
 _REIT_ONLY_FACT_FIELDS = frozenset({"distribution_per_unit", "nav_per_unit"})
 _REIT_REQUIRED_FACT_FIELDS = (
@@ -180,6 +188,15 @@ class _SecFact:
 class _TtmWindow:
     facts: tuple[_SecFact, _SecFact, _SecFact, _SecFact]
     final_frame_index: int
+    field_priority: int
+    concept_priority: int
+
+
+@dataclass(frozen=True)
+class _AnnualYtdTtmWindow:
+    annual: _SecFact
+    prior_ytd: _SecFact
+    current_ytd: _SecFact
     field_priority: int
     concept_priority: int
 
@@ -365,6 +382,18 @@ def _build_annual_periods(
 def _build_ttm_period(
     concepts: Mapping[str, Any], currency: str
 ) -> FinancialPeriod | None:
+    standalone = _build_standalone_quarter_ttm_period(concepts, currency)
+    annual_ytd = _build_annual_ytd_ttm_period(concepts, currency)
+    if standalone is None:
+        return annual_ytd
+    if annual_ytd is None:
+        return standalone
+    return standalone if standalone.period_end >= annual_ytd.period_end else annual_ytd
+
+
+def _build_standalone_quarter_ttm_period(
+    concepts: Mapping[str, Any], currency: str
+) -> FinancialPeriod | None:
     all_quarters: dict[str, dict[str, list[_SecFact]]] = {
         field: {
             concept: [
@@ -424,6 +453,164 @@ def _build_ttm_period(
     values["period_end"] = window.facts[-1].end
     values["sources"] = sources
     return FinancialPeriod(**values)
+
+
+def _build_annual_ytd_ttm_period(
+    concepts: Mapping[str, Any], currency: str
+) -> FinancialPeriod | None:
+    all_facts: dict[str, dict[str, list[_SecFact]]] = {
+        field: {
+            concept: _concept_facts(
+                concepts,
+                concept,
+                _units_for_field(field, currency),
+            )
+            for concept in concept_names
+        }
+        for field, concept_names in _CONCEPTS.items()
+    }
+    window = _latest_annual_ytd_ttm_window(all_facts)
+    if window is None:
+        return None
+
+    values: dict[str, Any] = {
+        "fiscal_year": None,
+        "is_ttm": True,
+        "currency": currency,
+        "period_end": window.current_ytd.end,
+        "interest_paid_outside_operating": 0.0,
+    }
+    sources: dict[str, FactProvenance] = {}
+    for field, concept_names in _CONCEPTS.items():
+        if field in _ADDITIVE_FIELDS:
+            facts = _select_annual_ytd_facts(
+                all_facts[field], concept_names, field, window
+            )
+            if facts is None:
+                continue
+            annual, prior_ytd, current_ytd = facts
+            values[field] = annual.value - prior_ytd.value + current_ytd.value
+            sources[field] = _provenance(current_ytd)
+        elif field == "interest_paid_outside_operating":
+            continue
+        elif field == "diluted_shares":
+            selected = _select_duration_at_period_end(
+                all_facts[field], concept_names, window.current_ytd.end
+            )
+            if selected is None:
+                continue
+            values[field] = selected.value
+            sources[field] = _provenance(selected)
+        else:
+            selected = _select_instant_at_window_end(
+                all_facts[field], concept_names, window.current_ytd.end
+            )
+            if selected is None:
+                continue
+            values[field] = selected.value
+            sources[field] = _provenance(selected)
+
+    if not _OWNER_EARNINGS_TTM_FIELDS.issubset(values):
+        return None
+    if not sources:
+        return None
+    values["sources"] = sources
+    return FinancialPeriod(**values)
+
+
+def _latest_annual_ytd_ttm_window(
+    all_facts: Mapping[str, Mapping[str, list[_SecFact]]],
+) -> _AnnualYtdTtmWindow | None:
+    candidates: list[_AnnualYtdTtmWindow] = []
+    for field_priority, (field, concept_names) in enumerate(_CONCEPTS.items()):
+        if field in _INSTANT_FIELDS or field == "interest_paid_outside_operating":
+            continue
+        for concept_priority, concept in enumerate(concept_names):
+            by_frame: dict[int, list[_SecFact]] = {}
+            for fact in all_facts[field][concept]:
+                frame_index = _frame_index(fact.frame)
+                if frame_index is not None and _is_ytd_fact(fact):
+                    by_frame.setdefault(frame_index, []).append(fact)
+            observations = {
+                frame_index: _latest_compatible_duration_fact(facts)
+                for frame_index, facts in by_frame.items()
+            }
+            annual_facts = [
+                fact
+                for fact in all_facts[field][concept]
+                if _is_annual_fact(fact, field)
+            ]
+            for current_frame_index, current_ytd in observations.items():
+                prior_ytd = observations.get(current_frame_index - 4)
+                if prior_ytd is None or current_ytd.start is None:
+                    continue
+                annual_candidates = [
+                    fact
+                    for fact in annual_facts
+                    if prior_ytd.end < fact.end <= current_ytd.start
+                ]
+                if not annual_candidates:
+                    continue
+                candidates.append(
+                    _AnnualYtdTtmWindow(
+                        annual=max(
+                            annual_candidates,
+                            key=lambda fact: (fact.end, fact.filed or date.min),
+                        ),
+                        prior_ytd=prior_ytd,
+                        current_ytd=current_ytd,
+                        field_priority=field_priority,
+                        concept_priority=concept_priority,
+                    )
+                )
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda window: (
+            window.current_ytd.end,
+            _frame_index(window.current_ytd.frame) or -1,
+            -window.field_priority,
+            -window.concept_priority,
+        ),
+    )
+
+
+def _select_annual_ytd_facts(
+    concepts_by_name: Mapping[str, list[_SecFact]],
+    concept_names: tuple[str, ...],
+    field: str,
+    window: _AnnualYtdTtmWindow,
+) -> tuple[_SecFact, _SecFact, _SecFact] | None:
+    for concept in concept_names:
+        annual_candidates = [
+            fact
+            for fact in concepts_by_name[concept]
+            if fact.end == window.annual.end and _is_annual_fact(fact, field)
+        ]
+        prior_candidates = [
+            fact
+            for fact in concepts_by_name[concept]
+            if fact.frame == window.prior_ytd.frame
+            and fact.start == window.prior_ytd.start
+            and fact.end == window.prior_ytd.end
+            and _is_ytd_fact(fact)
+        ]
+        current_candidates = [
+            fact
+            for fact in concepts_by_name[concept]
+            if fact.frame == window.current_ytd.frame
+            and fact.start == window.current_ytd.start
+            and fact.end == window.current_ytd.end
+            and _is_ytd_fact(fact)
+        ]
+        if annual_candidates and prior_candidates and current_candidates:
+            return (
+                _latest_compatible_duration_fact(annual_candidates),
+                _latest_compatible_duration_fact(prior_candidates),
+                _latest_compatible_duration_fact(current_candidates),
+            )
+    return None
 
 
 def _latest_ttm_window(
@@ -519,6 +706,22 @@ def _select_duration_at_window_end(
             fact
             for fact in concepts_by_name[concept]
             if fact.start == window_fact.start and fact.end == window_fact.end
+        ]
+        if candidates:
+            return _latest_compatible_duration_fact(candidates)
+    return None
+
+
+def _select_duration_at_period_end(
+    concepts_by_name: Mapping[str, list[_SecFact]],
+    concept_names: tuple[str, ...],
+    period_end: date,
+) -> _SecFact | None:
+    for concept in concept_names:
+        candidates = [
+            fact
+            for fact in concepts_by_name[concept]
+            if fact.end == period_end and fact.start is not None
         ]
         if candidates:
             return _latest_compatible_duration_fact(candidates)
@@ -659,6 +862,16 @@ def _is_quarter_fact(fact: _SecFact, field: str) -> bool:
     if fact.start is None:
         return False
     return 75 <= (fact.end - fact.start).days <= 105
+
+
+def _is_ytd_fact(fact: _SecFact) -> bool:
+    frame_index = _frame_index(fact.frame)
+    if frame_index is None or fact.start is None:
+        return False
+    quarter = (frame_index % 4) + 1
+    if quarter not in {1, 2, 3}:
+        return False
+    return 75 <= (fact.end - fact.start).days <= 300
 
 
 def _frame_index(frame: str | None) -> int | None:

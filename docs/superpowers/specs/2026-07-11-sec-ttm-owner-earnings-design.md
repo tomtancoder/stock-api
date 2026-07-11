@@ -32,7 +32,9 @@ and avoids mixing aliases or overlapping durations.
 
 For balance-sheet fields, use the latest compatible instant fact at the TTM
 end. For diluted shares, use the compatible duration fact ending at that date.
-Interest paid remains zero only under the existing SEC accounting treatment.
+Set the external-interest adjustment to zero for SEC-derived periods because
+US GAAP reports cash interest in operating cash flow; this prevents a second
+subtraction when the quarterly interest disclosure is absent.
 
 The existing four-standalone-quarter route remains available as a fallback. No
 TTM is emitted if a required owner-earnings cash-flow component cannot be
@@ -42,8 +44,9 @@ derived from one coherent annual/YTD relationship.
 
 - Preserve SEC fact provenance for derived values, identifying the current
   filing as the primary source.
-- Reject mixed concepts, nonmatching quarter ends, nonconsecutive fiscal years,
-  incompatible currencies, and missing comparison periods.
+- Reject mixed concepts, nonmatching SEC calendar frames, incompatible
+  currencies, and missing comparison periods. SEC `fy` metadata is filing
+  metadata for comparative facts and is not used as period identity.
 - Add unit coverage for a Tesla-like annual plus Q1 year-to-date sequence and
   regression coverage proving owner-earnings valuation becomes eligible only
   with a complete derived TTM.

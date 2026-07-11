@@ -840,12 +840,10 @@ def test_derives_latest_ttm_from_annual_and_matching_ytd_facts(
                 )
             },
             "InterestPaidNet": {
-                "USD": series(
-                    (0.0, 0.0, 0.0),
-                    0.0,
-                    0.0,
-                    concept="interest-paid",
-                )
+                "USD": [
+                    annual(0.0, year, concept="interest-paid")
+                    for year in (2023, 2024, 2025)
+                ]
             },
             "Revenues": {
                 "USD": series(
@@ -877,6 +875,7 @@ def test_derives_latest_ttm_from_annual_and_matching_ytd_facts(
     assert ttm.capital_expenditure == pytest.approx(9_528.0)
     assert ttm.stock_based_compensation == pytest.approx(3_282.0)
     assert ttm.revenue == pytest.approx(97_879.0)
+    assert ttm.interest_paid_outside_operating == 0.0
     assert ttm.sources["operating_cash_flow"].accession == "current-q1"
 
     model_result = value_owner_earnings(fundamentals)
@@ -899,6 +898,58 @@ def test_does_not_derive_ytd_ttm_without_prior_matching_quarter(
                         fiscal_year=2025,
                         fiscal_period="FY",
                         frame="CY2025",
+                    ),
+                    sec_fact(
+                        22_387.0,
+                        start="2026-01-01",
+                        end="2026-03-31",
+                        form="10-Q",
+                        filed="2026-04-30",
+                        fiscal_year=2026,
+                        fiscal_period="Q1",
+                        frame="CY2026Q1",
+                    ),
+                ]
+            }
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    from app.services import sec_companyfacts
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+
+    assert all(
+        not period.is_ttm or period.period_end.isoformat() != "2026-03-31"
+        for period in result.periods
+    )
+
+
+def test_does_not_build_annual_ytd_ttm_without_owner_earnings_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = company_facts(
+        {
+            "Revenues": {
+                "USD": [
+                    sec_fact(
+                        94_827.0,
+                        start="2025-01-01",
+                        end="2025-12-31",
+                        form="10-K",
+                        fiscal_year=2025,
+                        fiscal_period="FY",
+                        frame="CY2025",
+                    ),
+                    sec_fact(
+                        19_335.0,
+                        start="2025-01-01",
+                        end="2025-03-31",
+                        form="10-Q",
+                        filed="2025-04-30",
+                        fiscal_year=2025,
+                        fiscal_period="Q1",
+                        frame="CY2025Q1",
                     ),
                     sec_fact(
                         22_387.0,

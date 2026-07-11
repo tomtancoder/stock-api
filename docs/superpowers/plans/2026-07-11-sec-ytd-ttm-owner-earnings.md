@@ -13,7 +13,9 @@
 - Do not change public routes, schemas, company classification, DCF assumptions, or SGX routing.
 - Derive each additive field only as `prior FY - prior-year matching YTD + current-year matching YTD`.
 - Use the same SEC concept and unit for all three facts of a derived field.
-- Require matching Q1, Q2, or Q3 frames from consecutive fiscal years.
+- Require matching Q1, Q2, or Q3 SEC calendar frames one year apart; SEC `fy`
+  metadata can describe the filing year for comparative facts and is not used
+  as the period identity.
 - Preserve current-year SEC provenance and retain the standalone-quarter strategy.
 - Keep the current two-independent-components owner-earnings requirement.
 
@@ -115,13 +117,12 @@ class _AnnualYtdTtmWindow:
 
 - [ ] **Step 2: Add `_latest_annual_ytd_ttm_window()`**
 
-For every non-instant field and each concept independently, select a current fact whose frame is Q1–Q3. Find the prior fact at `(_frame_index(current.frame) - 4)` and an annual fact from the prior fiscal year. Require:
+For every non-instant field and each concept independently, select a current fact whose frame is Q1-Q3. Find the prior fact at `(_frame_index(current.frame) - 4)` and an annual fact ending between the prior YTD end and the current YTD start. Require:
 
 ```python
-current.fiscal_year == prior_ytd.fiscal_year + 1
-annual.fiscal_year == prior_ytd.fiscal_year
 _is_annual_fact(annual, field)
 current.start is not None and prior_ytd.start is not None
+prior_ytd.end < annual.end <= current.start
 0 < (current.end - current.start).days <= 300
 0 < (prior_ytd.end - prior_ytd.start).days <= 300
 ```
@@ -140,7 +141,7 @@ Use `current_ytd` for provenance.
 
 - [ ] **Step 4: Add `_build_annual_ytd_ttm_period()`**
 
-Populate additive fields with `_select_annual_ytd_facts()`. Populate instant fields with `_select_instant_at_window_end()` and diluted shares with `_select_duration_at_window_end()` at `current_ytd.end`. Preserve existing SEC external-interest handling by emitting `0.0` only when a compatible interest fact exists. Return `None` if the candidate has no fields.
+Populate additive fields with `_select_annual_ytd_facts()`. Populate instant fields with `_select_instant_at_window_end()` and diluted shares with a compatible duration fact ending at `current_ytd.end`. Set `interest_paid_outside_operating` to `0.0` for all SEC-derived periods because US GAAP includes cash interest in operating cash flow. Return `None` if the candidate has no fields.
 
 - [ ] **Step 5: Choose the newest strategy**
 
