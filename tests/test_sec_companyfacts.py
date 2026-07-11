@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from app.core.config import Settings
+from app.services.owner_earnings_valuation import value_owner_earnings
 
 
 class FakeResponse:
@@ -763,6 +764,166 @@ def test_returns_five_annual_periods_and_latest_four_compatible_quarters_as_ttm(
     )
     assert ttm.sources["revenue"].accession == "quarter-CY2026Q3"
     assert result.current_diluted_shares == 13.0
+
+
+def test_derives_latest_ttm_from_annual_and_matching_ytd_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def annual(
+        value: float, year: int, *, concept: str
+    ) -> dict[str, object]:
+        return sec_fact(
+            value,
+            start=f"{year}-01-01",
+            end=f"{year}-12-31",
+            form="10-K",
+            filed=f"{year + 1}-02-01",
+            accession=f"{concept}-annual-{year}",
+            fiscal_year=year,
+            fiscal_period="FY",
+            frame=f"CY{year}",
+        )
+
+    def q1(
+        value: float, year: int, *, concept: str
+    ) -> dict[str, object]:
+        return sec_fact(
+            value,
+            start=f"{year}-01-01",
+            end=f"{year}-03-31",
+            form="10-Q",
+            filed=f"{year}-04-30",
+            accession=("prior-q1" if year == 2025 else "current-q1"),
+            fiscal_year=year,
+            fiscal_period="Q1",
+            frame=f"CY{year}Q1",
+        )
+
+    def series(
+        annual_values: tuple[float, float, float],
+        prior_q1: float,
+        current_q1: float,
+        *,
+        concept: str,
+    ) -> list[dict[str, object]]:
+        return [
+            *(annual(value, year, concept=concept)
+              for year, value in zip((2023, 2024, 2025), annual_values)),
+            q1(prior_q1, 2025, concept=concept),
+            q1(current_q1, 2026, concept=concept),
+        ]
+
+    facts = company_facts(
+        {
+            "NetCashProvidedByUsedInOperatingActivities": {
+                "USD": series(
+                    (12_000.0, 14_000.0, 14_747.0),
+                    2_156.0,
+                    3_937.0,
+                    concept="operating-cash-flow",
+                )
+            },
+            "PaymentsToAcquirePropertyPlantAndEquipment": {
+                "USD": series(
+                    (2_000.0, 2_500.0, 8_527.0),
+                    1_492.0,
+                    2_493.0,
+                    concept="capital-expenditure",
+                )
+            },
+            "ShareBasedCompensation": {
+                "USD": series(
+                    (500.0, 650.0, 2_825.0),
+                    573.0,
+                    1_030.0,
+                    concept="stock-compensation",
+                )
+            },
+            "InterestPaidNet": {
+                "USD": series(
+                    (0.0, 0.0, 0.0),
+                    0.0,
+                    0.0,
+                    concept="interest-paid",
+                )
+            },
+            "Revenues": {
+                "USD": series(
+                    (60_000.0, 75_000.0, 94_827.0),
+                    19_335.0,
+                    22_387.0,
+                    concept="revenue",
+                )
+            },
+            "WeightedAverageNumberOfDilutedSharesOutstanding": {
+                "shares": series(
+                    (100.0, 100.0, 100.0),
+                    100.0,
+                    100.0,
+                    concept="diluted-shares",
+                )
+            },
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    from app.services import sec_companyfacts
+
+    fundamentals = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+    ttm = next(period for period in fundamentals.periods if period.is_ttm)
+
+    assert ttm.period_end.isoformat() == "2026-03-31"
+    assert ttm.operating_cash_flow == pytest.approx(16_528.0)
+    assert ttm.capital_expenditure == pytest.approx(9_528.0)
+    assert ttm.stock_based_compensation == pytest.approx(3_282.0)
+    assert ttm.revenue == pytest.approx(97_879.0)
+    assert ttm.sources["operating_cash_flow"].accession == "current-q1"
+
+    model_result = value_owner_earnings(fundamentals)
+    assert model_result.method == "owner_earnings_dcf"
+    assert model_result.quality["eligible"] is True
+
+
+def test_does_not_derive_ytd_ttm_without_prior_matching_quarter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = company_facts(
+        {
+            "Revenues": {
+                "USD": [
+                    sec_fact(
+                        94_827.0,
+                        start="2025-01-01",
+                        end="2025-12-31",
+                        form="10-K",
+                        fiscal_year=2025,
+                        fiscal_period="FY",
+                        frame="CY2025",
+                    ),
+                    sec_fact(
+                        22_387.0,
+                        start="2026-01-01",
+                        end="2026-03-31",
+                        form="10-Q",
+                        filed="2026-04-30",
+                        fiscal_year=2026,
+                        fiscal_period="Q1",
+                        frame="CY2026Q1",
+                    ),
+                ]
+            }
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    from app.services import sec_companyfacts
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+
+    assert all(
+        not period.is_ttm or period.period_end.isoformat() != "2026-03-31"
+        for period in result.periods
+    )
 
 
 def test_does_not_build_ttm_from_nonconsecutive_quarter_frames(
