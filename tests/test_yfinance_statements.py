@@ -88,6 +88,65 @@ def install_ticker(monkeypatch: pytest.MonkeyPatch, ticker: FakeTicker) -> list[
     return symbols
 
 
+def test_normalizes_compact_yfinance_statement_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticker = FakeTicker(
+        cashflow={
+            "yearly": statement(
+                {
+                    "OperatingCashFlow": 1_000.0,
+                    "CapitalExpenditure": -200.0,
+                    "StockBasedCompensation": 50.0,
+                    "CashDividendsPaid": -10.0,
+                },
+                "2025-12-31",
+                currency="USD",
+            )
+        },
+        income={
+            "yearly": statement(
+                {
+                    "TotalRevenue": 2_000.0,
+                    "NetIncomeCommonStockholders": 500.0,
+                    "DilutedAverageShares": 100.0,
+                },
+                "2025-12-31",
+                currency="USD",
+            )
+        },
+        balance={
+            "yearly": statement(
+                {
+                    "CommonStockEquity": 3_000.0,
+                    "CashAndCashEquivalents": 400.0,
+                    "TotalAssets": 5_000.0,
+                    "TotalDebt": 600.0,
+                },
+                "2025-12-31",
+                currency="USD",
+            )
+        },
+        info={"financialCurrency": "USD"},
+        fast_info={"currency": "USD"},
+    )
+    install_ticker(monkeypatch, ticker)
+
+    period = fetch_yfinance_fundamentals("NASDAQ", "TSLA").periods[0]
+
+    assert period.operating_cash_flow == 1_000.0
+    assert period.capital_expenditure == -200.0
+    assert period.stock_based_compensation == 50.0
+    assert period.common_dividends == -10.0
+    assert period.revenue == 2_000.0
+    assert period.net_income_common == 500.0
+    assert period.diluted_shares == 100.0
+    assert period.common_equity == 3_000.0
+    assert period.cash_and_equivalents == 400.0
+    assert period.total_assets == 5_000.0
+    assert period.total_debt == 600.0
+
+
 @pytest.mark.parametrize(
     ("statement_kind", "row_alias", "field"),
     [

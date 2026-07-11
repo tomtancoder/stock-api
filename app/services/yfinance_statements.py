@@ -1035,13 +1035,18 @@ def _extract_value(
     if column is None:
         return None
     for alias in aliases:
+        normalized_alias = _normalized_label(alias)
         for row_position, row_name in enumerate(frame.index):
-            if row_name != alias:
+            if _normalized_label(row_name) != normalized_alias:
                 continue
             value = _finite_float(frame.iloc[row_position, column])
             if value is not None:
-                return value, alias
+                return value, str(row_name)
     return None
+
+
+def _normalized_label(value: Any) -> str:
+    return "".join(character.casefold() for character in str(value) if character.isalnum())
 
 
 def _selected_columns(frame: pd.DataFrame) -> dict[date, int]:
