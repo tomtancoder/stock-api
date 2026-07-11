@@ -246,6 +246,16 @@ def test_market_valuation_endpoint_returns_typed_service_response(monkeypatch):
     assert response.json()["method"] == "owner_earnings_dcf"
 
 
+def test_openapi_documents_canonical_valuation_and_hides_legacy_post():
+    schema = client.get("/openapi.json").json()
+
+    canonical_path = "/api/v1/markets/{exchange}/{symbol}/valuation"
+    legacy_path = "/api/v1/stocks/{symbol}/valuation"
+
+    assert schema["paths"][canonical_path]["get"]["operationId"]
+    assert legacy_path not in schema["paths"]
+
+
 def test_market_bank_valuation_normalizes_both_d05_forms_and_stays_independent(
     monkeypatch,
 ):

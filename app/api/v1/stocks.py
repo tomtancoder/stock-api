@@ -45,7 +45,7 @@ def technicals(
     )
 
 
-@router.post("/{symbol}/valuation")
+@router.post("/{symbol}/valuation", include_in_schema=False)
 def valuation(
     symbol: str = Path(..., min_length=1, max_length=64),
     exchange: str | None = Query(default=None, min_length=1, max_length=32),
