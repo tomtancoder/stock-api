@@ -3,8 +3,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Path, Query
 
 from app.core.config import get_settings
-from app.schemas import QuoteResponse
+from app.schemas import QuoteResponse, ValuationResponse
 from app.services import tradingview_provider as provider
+from app.services import valuation_service
 from app.services.tradingview_provider import TradingViewProviderError
 
 router = APIRouter(prefix="/markets", tags=["markets"])
@@ -46,6 +47,24 @@ def technical(
         timeframe or get_settings().default_timeframe,
         include_multi_timeframe,
     )
+
+
+@router.get(
+    "/{exchange}/{symbol}/valuation",
+    response_model=ValuationResponse,
+)
+def valuation(
+    exchange: str = Path(..., min_length=1, max_length=32),
+    symbol: str = Path(..., min_length=1, max_length=64),
+) -> ValuationResponse:
+    try:
+        return valuation_service.get_valuation(exchange, symbol)
+    except valuation_service.ValuationServiceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=exc.headers,
+        ) from exc
 
 
 @router.get("/{exchange}/gainers")

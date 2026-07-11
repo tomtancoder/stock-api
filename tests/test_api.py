@@ -5,6 +5,175 @@ from app.main import app
 client = TestClient(app)
 
 
+def _valuation_response_payload(*, unreliable: bool = False):
+    return {
+        "symbol": "SGX:S63",
+        "exchange": "SGX",
+        "currency": "SGD",
+        "detected_company_type": "reit" if unreliable else "operating_company",
+        "method": None if unreliable else "owner_earnings_dcf",
+        "classification_sources": [
+            "provider_industry",
+            "statement_structure",
+        ],
+        "status": "valuation_unreliable" if unreliable else "fair",
+        "confidence": None if unreliable else "medium",
+        "current_price": 7.15,
+        "price_as_of": "2026-07-10T10:15:00Z",
+        "intrinsic_value": (
+            None
+            if unreliable
+            else {
+                "bear": 5.8,
+                "base": 7.5,
+                "bull": 9.1,
+                "margin_of_safety_price": 5.625,
+                "price_to_base_value": 0.9533,
+                "upside_downside_percent": 4.9,
+            }
+        ),
+        "model_details": (
+            None
+            if unreliable
+            else {
+                "method": "owner_earnings_dcf",
+                "normalized_owner_earnings": 750.0,
+                "owner_earnings_per_share": 7.5,
+                "maintenance_capex_method": "total_capital_expenditure",
+                "annual_history": [],
+                "derived_growth": 0.04,
+                "usable_years": 5,
+            }
+        ),
+        "quality": {
+            "eligible": not unreliable,
+            "reasons": (
+                ["REIT valuation is recognized but not supported yet."]
+                if unreliable
+                else []
+            ),
+        },
+        "assumptions": (
+            {}
+            if unreliable
+            else {"projection_years": 10, "margin_of_safety": 0.25}
+        ),
+        "data_quality": {
+            "primary_source": "yfinance_sgx",
+            "financials_as_of": "2025-12-31",
+            "valuation_as_of": "2026-07-10T10:30:00Z",
+            "next_refresh_at": "2026-07-11T10:30:00Z",
+            "stale": False,
+            "missing_fields": [],
+        },
+        "sources": {
+            "operating_cash_flow": "yfinance_sgx",
+            "current_price": "existing_quote_provider",
+        },
+        "warnings": [],
+    }
+
+
+def _bank_valuation_response_payload():
+    payload = _valuation_response_payload()
+    payload.update(
+        {
+            "symbol": "SGX:D05",
+            "detected_company_type": "bank",
+            "method": "bank_residual_income",
+            "current_price": 9.0,
+            "intrinsic_value": {
+                "bear": 9.5,
+                "base": 10.5,
+                "bull": 11.5,
+                "margin_of_safety_price": 7.875,
+                "price_to_base_value": 0.8571,
+                "upside_downside_percent": 16.6667,
+            },
+            "model_details": {
+                "method": "bank_residual_income",
+                "normalized_roe": 0.12,
+                "book_value_per_share": 10.0,
+                "payout_ratio": 0.40,
+                "usable_years": 4,
+                "projected_book_equity": {
+                    "bear": [10_100.0],
+                    "base": [10_200.0],
+                    "bull": [10_300.0],
+                },
+                "cet1_ratio": 0.14,
+                "npl_ratio": 0.02,
+                "loan_loss_coverage": 1.5,
+            },
+            "sources": {
+                "common_equity": "yfinance",
+                "cet1_ratio": "yfinance_info",
+                "npl_ratio": "yfinance_info",
+                "loan_loss_coverage": "yfinance_info",
+                "current_price": "existing_quote_provider",
+            },
+        }
+    )
+    return payload
+
+
+def _reit_valuation_response_payload(*, distribution_only: bool = False):
+    payload = _valuation_response_payload()
+    payload.update(
+        {
+            "symbol": "SGX:C38U",
+            "detected_company_type": "reit",
+            "method": (
+                "reit_distribution_only"
+                if distribution_only
+                else "reit_distribution_nav"
+            ),
+            "confidence": "low" if distribution_only else "medium",
+            "current_price": 0.93,
+            "intrinsic_value": {
+                "bear": 0.80,
+                "base": 1.00,
+                "bull": 1.20,
+                "margin_of_safety_price": 0.75,
+                "price_to_base_value": 0.93,
+                "upside_downside_percent": 7.5269,
+            },
+            "model_details": {
+                "method": (
+                    "reit_distribution_only"
+                    if distribution_only
+                    else "reit_distribution_nav"
+                ),
+                "normalized_dpu": 0.061,
+                "nav_per_unit": None if distribution_only else 1.11,
+                "price_to_nav": None,
+                "distribution_yield": 0.0656,
+                "usable_years": 4,
+                "present_value_distributions": {
+                    "bear": 0.31,
+                    "base": 0.38,
+                    "bull": 0.47,
+                },
+                "present_value_terminal": {
+                    "bear": 0.49,
+                    "base": 0.62,
+                    "bull": 0.73,
+                },
+                "aggregate_leverage": 0.34,
+                "interest_coverage": 3.2,
+                "occupancy": 0.98,
+                "wale_years": 4.1,
+            },
+            "sources": {
+                "distribution_per_unit": "yfinance_dividends",
+                "nav_per_unit": "yfinance_balance_sheet",
+                "current_price": "existing_quote_provider",
+            },
+        }
+    )
+    return payload
+
+
 def test_health():
     response = client.get("/health")
 
@@ -57,6 +226,252 @@ def test_market_quote_endpoint_uses_tradingview_provider(monkeypatch):
     assert payload["change_percent"] == 1.1626
     assert payload["fifty_two_week_high"] == 555.45
     assert payload["fifty_two_week_low"] == 349.2
+
+
+def test_market_valuation_endpoint_returns_typed_service_response(monkeypatch):
+    from app.api.v1 import markets
+
+    def fake_valuation(exchange: str, symbol: str):
+        assert (exchange, symbol) == ("SGX", "S63")
+        return _valuation_response_payload()
+
+    monkeypatch.setattr(
+        markets.valuation_service, "get_valuation", fake_valuation
+    )
+
+    response = client.get("/api/v1/markets/SGX/S63/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "SGX:S63"
+    assert response.json()["method"] == "owner_earnings_dcf"
+
+
+def test_openapi_documents_canonical_valuation_and_hides_legacy_post():
+    schema = client.get("/openapi.json").json()
+
+    canonical_path = "/api/v1/markets/{exchange}/{symbol}/valuation"
+    legacy_path = "/api/v1/stocks/{symbol}/valuation"
+
+    assert schema["paths"][canonical_path]["get"]["operationId"]
+    assert legacy_path not in schema["paths"]
+
+
+def test_market_bank_valuation_normalizes_both_d05_forms_and_stays_independent(
+    monkeypatch,
+):
+    from app.api.v1 import markets
+
+    valuation_calls = []
+    technical_calls = []
+
+    def fake_valuation(exchange: str, symbol: str):
+        valuation_calls.append((exchange, symbol))
+        return _bank_valuation_response_payload()
+
+    def fake_technical(
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        include_multi_timeframe: bool,
+    ):
+        technical_calls.append(
+            (exchange, symbol, timeframe, include_multi_timeframe)
+        )
+        return {
+            "symbol": "SGX:D05",
+            "timeframe": timeframe,
+            "source": "tradingview_mcp",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(
+        markets.valuation_service, "get_valuation", fake_valuation
+    )
+    monkeypatch.setattr(
+        markets.provider, "get_technical_analysis", fake_technical
+    )
+
+    bare = client.get("/api/v1/markets/SGX/D05/valuation")
+    suffixed = client.get("/api/v1/markets/SGX/D05.SI/valuation")
+    technical = client.get("/api/v1/markets/SGX/D05/technical")
+
+    assert bare.status_code == 200
+    assert suffixed.status_code == 200
+    assert bare.json() == suffixed.json()
+    payload = bare.json()
+    assert payload["symbol"] == "SGX:D05"
+    assert payload["currency"] == "SGD"
+    assert payload["method"] == "bank_residual_income"
+    assert payload["model_details"]["method"] == "bank_residual_income"
+    assert "normalized_owner_earnings" not in payload["model_details"]
+    assert "owner_earnings_per_share" not in payload["model_details"]
+    assert valuation_calls == [("SGX", "D05"), ("SGX", "D05.SI")]
+    assert technical.status_code == 200
+    assert technical.json()["source"] == "tradingview_mcp"
+    assert technical_calls == [("SGX", "D05", "1D", False)]
+
+
+def test_market_reit_valuation_accepts_sgx_forms_and_returns_typed_details(
+    monkeypatch,
+):
+    from app.api.v1 import markets
+
+    calls = []
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: calls.append((exchange, symbol))
+        or _reit_valuation_response_payload(),
+    )
+
+    bare = client.get("/api/v1/markets/SGX/C38U/valuation")
+    suffixed = client.get("/api/v1/markets/SGX/C38U.SI/valuation")
+
+    assert bare.status_code == 200
+    assert suffixed.status_code == 200
+    assert bare.json() == suffixed.json()
+    payload = bare.json()
+    assert payload["symbol"] == "SGX:C38U"
+    assert payload["currency"] == "SGD"
+    assert payload["method"] == "reit_distribution_nav"
+    assert payload["confidence"] == "medium"
+    assert payload["model_details"]["method"] == "reit_distribution_nav"
+    assert payload["model_details"]["normalized_dpu"] == 0.061
+    assert payload["sources"]["distribution_per_unit"] == "yfinance_dividends"
+    assert calls == [("SGX", "C38U"), ("SGX", "C38U.SI")]
+
+
+def test_market_valuation_endpoint_maps_not_found_service_error(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            markets.valuation_service.ValuationServiceError(
+                "No valuation data found for SGX:MISSING.",
+                status_code=404,
+            )
+        ),
+    )
+
+    response = client.get("/api/v1/markets/SGX/MISSING/valuation")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "No valuation data found for SGX:MISSING."
+    )
+
+
+def test_market_valuation_endpoint_preserves_retry_after_on_502(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            markets.valuation_service.ValuationServiceError(
+                "Quote provider is busy.",
+                status_code=502,
+                retry_after_s=60,
+            )
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/valuation")
+
+    assert response.status_code == 502
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["detail"] == "Quote provider is busy."
+
+
+def test_market_valuation_endpoint_propagates_sec_retry_after(monkeypatch):
+    from app.api.v1 import markets
+    from app.services.sec_companyfacts import SecCompanyFactsError
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_fundamentals",
+        lambda exchange, symbol: (_ for _ in ()).throw(
+            SecCompanyFactsError("SEC rate limit exceeded.", retry_after_s=60)
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/valuation")
+
+    assert response.status_code == 502
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["detail"] == "SEC rate limit exceeded."
+
+
+def test_market_valuation_endpoint_returns_stale_quote_response(monkeypatch):
+    from app.api.v1 import markets
+
+    payload = _valuation_response_payload()
+    payload["data_quality"]["stale"] = True
+    payload["warnings"] = [
+        "Quote refresh failed; serving stale cached data: Quote provider is busy."
+    ]
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: payload,
+    )
+
+    response = client.get("/api/v1/markets/SGX/S63/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["data_quality"]["stale"] is True
+    assert response.json()["warnings"] == payload["warnings"]
+
+
+def test_market_valuation_endpoint_returns_unreliable_as_200(monkeypatch):
+    from app.api.v1 import markets
+
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: _valuation_response_payload(unreliable=True),
+    )
+
+    response = client.get("/api/v1/markets/SGX/C38U/valuation")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "valuation_unreliable"
+    assert response.json()["method"] is None
+
+
+def test_market_technical_endpoint_never_calls_valuation_service(monkeypatch):
+    from app.api.v1 import markets
+
+    valuation_calls = []
+    technical_calls = []
+    monkeypatch.setattr(
+        markets.valuation_service,
+        "get_valuation",
+        lambda exchange, symbol: valuation_calls.append((exchange, symbol)),
+    )
+    monkeypatch.setattr(
+        markets.provider,
+        "get_technical_analysis",
+        lambda exchange, symbol, timeframe, include_multi_timeframe: (
+            technical_calls.append(
+                (exchange, symbol, timeframe, include_multi_timeframe)
+            )
+            or {
+                "symbol": f"{exchange}:{symbol}",
+                "timeframe": timeframe,
+                "source": "tradingview_mcp",
+                "warnings": [],
+            }
+        ),
+    )
+
+    response = client.get("/api/v1/markets/NASDAQ/ACME/technical")
+
+    assert response.status_code == 200
+    assert technical_calls == [("NASDAQ", "ACME", "1D", False)]
+    assert valuation_calls == []
 
 
 def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
