@@ -352,7 +352,6 @@ def _build_annual_periods(
             "currency": currency,
         }
         sources: dict[str, FactProvenance] = {}
-        fiscal_years: list[int] = []
         for field, concept_names in _CONCEPTS.items():
             selected = _select_for_period(
                 candidates[field], concept_names, period_end, field
@@ -365,15 +364,9 @@ def _build_annual_periods(
                 else selected.value
             )
             sources[field] = _provenance(selected)
-            if selected.fiscal_year is not None:
-                fiscal_years.append(selected.fiscal_year)
         if not sources:
             continue
-        values["fiscal_year"] = (
-            Counter(fiscal_years).most_common(1)[0][0]
-            if fiscal_years
-            else period_end.year
-        )
+        values["fiscal_year"] = period_end.year
         values["sources"] = sources
         periods.append(FinancialPeriod(**values))
     return periods

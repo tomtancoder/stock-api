@@ -766,6 +766,38 @@ def test_returns_five_annual_periods_and_latest_four_compatible_quarters_as_ttm(
     assert result.current_diluted_shares == 13.0
 
 
+def test_annual_periods_keep_historical_years_when_latest_filing_reports_comparatives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import sec_companyfacts
+
+    facts = company_facts(
+        {
+            "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                "USD": [
+                    sec_fact(
+                        year * 10,
+                        start=f"{year}-01-01",
+                        end=f"{year}-12-31",
+                        filed="2026-02-01",
+                        accession="annual-2025",
+                        fiscal_year=2025,
+                        frame=f"CY{year}",
+                    )
+                    for year in range(2021, 2026)
+                ]
+            }
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    result = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+
+    assert [
+        period.fiscal_year for period in result.periods if not period.is_ttm
+    ] == [2021, 2022, 2023, 2024, 2025]
+
+
 def test_derives_latest_ttm_from_annual_and_matching_ytd_facts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
