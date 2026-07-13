@@ -308,7 +308,7 @@ def test_interest_classification_is_specific_to_statement_frequency(
     )
 
 
-def test_sgx_provider_normalizes_symbols_currency_periods_and_calls_all_sources(
+def test_sgx_provider_normalizes_symbols_currency_periods_and_calls_supported_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     annual_periods = ("2025-12-31", "2024-12-31")
@@ -416,8 +416,11 @@ def test_sgx_provider_normalizes_symbols_currency_periods_and_calls_all_sources(
         if kind in {"cashflow", "income", "balance"}
     } == {
         (kind, freq)
-        for kind in ("cashflow", "income", "balance")
+        for kind in ("cashflow", "income")
         for freq in ("yearly", "quarterly", "trailing")
+    } | {
+        ("balance", "yearly"),
+        ("balance", "quarterly"),
     }
     assert ("shares", None) in ticker.calls
     assert ("info", None) in ticker.calls

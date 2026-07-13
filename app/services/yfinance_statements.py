@@ -249,7 +249,12 @@ def _read_statement_frames(
                 f"Unable to fetch yearly yFinance {kind} statement: {exc}"
             ) from exc
 
-        for frequency in ("quarterly", "trailing"):
+        optional_frequencies = (
+            ("quarterly",)
+            if kind == "balance"
+            else ("quarterly", "trailing")
+        )
+        for frequency in optional_frequencies:
             try:
                 frames[(kind, frequency)] = _as_frame(getter(freq=frequency))
             except Exception as exc:  # noqa: BLE001 - these variants are optional.
@@ -257,6 +262,8 @@ def _read_statement_frames(
                 warnings.append(
                     f"yFinance {frequency} {kind} statement unavailable: {exc}"
                 )
+        if kind == "balance":
+            frames[(kind, "trailing")] = pd.DataFrame()
     return frames
 
 
