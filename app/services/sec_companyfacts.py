@@ -519,50 +519,57 @@ def _latest_annual_ytd_ttm_window(
         if field in _INSTANT_FIELDS or field == "interest_paid_outside_operating":
             continue
         for concept_priority, concept in enumerate(concept_names):
-            by_frame: dict[int, list[_SecFact]] = {}
+            by_period: dict[tuple[date, date], list[_SecFact]] = {}
             for fact in all_facts[field][concept]:
-                frame_index = _frame_index(fact.frame)
-                if frame_index is not None and _is_ytd_fact(fact):
-                    by_frame.setdefault(frame_index, []).append(fact)
-            observations = {
-                frame_index: _latest_compatible_duration_fact(facts)
-                for frame_index, facts in by_frame.items()
-            }
+                if not _is_ytd_duration_fact(fact) or fact.start is None:
+                    continue
+                by_period.setdefault((fact.start, fact.end), []).append(fact)
+            observations = [
+                _latest_compatible_duration_fact(facts)
+                for facts in by_period.values()
+            ]
             annual_facts = [
                 fact
                 for fact in all_facts[field][concept]
                 if _is_annual_fact(fact, field)
             ]
-            for current_frame_index, current_ytd in observations.items():
-                prior_ytd = observations.get(current_frame_index - 4)
-                if prior_ytd is None or current_ytd.start is None:
-                    continue
-                annual_candidates = [
-                    fact
-                    for fact in annual_facts
-                    if prior_ytd.end < fact.end <= current_ytd.start
-                ]
-                if not annual_candidates:
-                    continue
-                candidates.append(
-                    _AnnualYtdTtmWindow(
-                        annual=max(
-                            annual_candidates,
-                            key=lambda fact: (fact.end, fact.filed or date.min),
-                        ),
-                        prior_ytd=prior_ytd,
-                        current_ytd=current_ytd,
-                        field_priority=field_priority,
-                        concept_priority=concept_priority,
+            for current_ytd in observations:
+                for prior_ytd in observations:
+                    if not _matching_ytd_periods(prior_ytd, current_ytd):
+                        continue
+                    annual_candidates = [
+                        fact
+                        for fact in annual_facts
+                        if prior_ytd.end < fact.end <= current_ytd.start
+                    ]
+                    if not annual_candidates:
+                        continue
+                    candidates.append(
+                        _AnnualYtdTtmWindow(
+                            annual=max(
+                                annual_candidates,
+                                key=lambda fact: (
+                                    fact.end,
+                                    fact.filed or date.min,
+                                ),
+                            ),
+                            prior_ytd=prior_ytd,
+                            current_ytd=current_ytd,
+                            field_priority=field_priority,
+                            concept_priority=concept_priority,
+                        )
                     )
-                )
     if not candidates:
         return None
     return max(
         candidates,
         key=lambda window: (
             window.current_ytd.end,
-            _frame_index(window.current_ytd.frame) or -1,
+            (
+                (window.current_ytd.end - window.current_ytd.start).days
+                if window.current_ytd.start is not None
+                else -1
+            ),
             -window.field_priority,
             -window.concept_priority,
         ),
@@ -584,18 +591,16 @@ def _select_annual_ytd_facts(
         prior_candidates = [
             fact
             for fact in concepts_by_name[concept]
-            if fact.frame == window.prior_ytd.frame
-            and fact.start == window.prior_ytd.start
+            if fact.start == window.prior_ytd.start
             and fact.end == window.prior_ytd.end
-            and _is_ytd_fact(fact)
+            and _is_ytd_duration_fact(fact)
         ]
         current_candidates = [
             fact
             for fact in concepts_by_name[concept]
-            if fact.frame == window.current_ytd.frame
-            and fact.start == window.current_ytd.start
+            if fact.start == window.current_ytd.start
             and fact.end == window.current_ytd.end
-            and _is_ytd_fact(fact)
+            and _is_ytd_duration_fact(fact)
         ]
         if annual_candidates and prior_candidates and current_candidates:
             return (
@@ -859,12 +864,43 @@ def _is_quarter_fact(fact: _SecFact, field: str) -> bool:
 
 def _is_ytd_fact(fact: _SecFact) -> bool:
     frame_index = _frame_index(fact.frame)
-    if frame_index is None or fact.start is None:
+    if frame_index is None:
         return False
     quarter = (frame_index % 4) + 1
     if quarter not in {1, 2, 3}:
         return False
+    return _is_ytd_duration_fact(fact)
+
+
+def _is_ytd_duration_fact(fact: _SecFact) -> bool:
+    if fact.form not in {"10-Q", "10-Q/A"} or fact.start is None:
+        return False
+    if fact.fiscal_period is not None and fact.fiscal_period not in {
+        "Q1",
+        "Q2",
+        "Q3",
+    }:
+        return False
     return 75 <= (fact.end - fact.start).days <= 300
+
+
+def _matching_ytd_periods(prior: _SecFact, current: _SecFact) -> bool:
+    if prior.start is None or current.start is None:
+        return False
+    if (
+        prior.fiscal_period is not None
+        and current.fiscal_period is not None
+        and prior.fiscal_period != current.fiscal_period
+    ):
+        return False
+    return (
+        300 <= (current.start - prior.start).days <= 430
+        and 300 <= (current.end - prior.end).days <= 430
+        and abs(
+            (current.end - current.start).days
+            - (prior.end - prior.start).days
+        ) <= 31
+    )
 
 
 def _frame_index(frame: str | None) -> int | None:

@@ -915,6 +915,194 @@ def test_derives_latest_ttm_from_annual_and_matching_ytd_facts(
     assert model_result.quality["eligible"] is True
 
 
+def test_derives_ttm_from_unframed_matching_fiscal_ytd_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def annual(
+        value: float, year: int, *, concept: str
+    ) -> dict[str, object]:
+        boundaries = {
+            2023: ("2022-09-25", "2023-09-30"),
+            2024: ("2023-10-01", "2024-09-28"),
+            2025: ("2024-09-29", "2025-09-27"),
+        }
+        start, end = boundaries[year]
+        return sec_fact(
+            value,
+            start=start,
+            end=end,
+            form="10-K",
+            filed=f"{year + 1}-02-01",
+            accession=f"{concept}-annual-{year}",
+            fiscal_year=year,
+            fiscal_period="FY",
+            frame=None,
+        )
+
+    def q2(
+        value: float, year: int, *, concept: str
+    ) -> dict[str, object]:
+        if year == 2025:
+            start, end, filed, accession = (
+                "2024-09-29",
+                "2025-03-29",
+                "2025-05-02",
+                "prior-q2",
+            )
+        else:
+            start, end, filed, accession = (
+                "2025-09-28",
+                "2026-03-28",
+                "2026-05-01",
+                "current-q2",
+            )
+        return sec_fact(
+            value,
+            start=start,
+            end=end,
+            form="10-Q",
+            filed=filed,
+            accession=f"{concept}-{accession}",
+            fiscal_year=year,
+            fiscal_period="Q2",
+            frame=None,
+        )
+
+    def standalone_q2(
+        value: float, year: int, *, concept: str
+    ) -> dict[str, object]:
+        if year == 2025:
+            start, end, filed, accession, frame = (
+                "2024-12-29",
+                "2025-03-29",
+                "2025-05-02",
+                "prior-q2",
+                "CY2025Q1",
+            )
+        else:
+            start, end, filed, accession, frame = (
+                "2025-12-28",
+                "2026-03-28",
+                "2026-05-01",
+                "current-q2",
+                "CY2026Q1",
+            )
+        return sec_fact(
+            value,
+            start=start,
+            end=end,
+            form="10-Q",
+            filed=filed,
+            accession=f"{concept}-{accession}",
+            fiscal_year=year,
+            fiscal_period="Q2",
+            frame=frame,
+        )
+
+    def series(
+        annual_values: tuple[float, float, float],
+        prior_q2: float,
+        current_q2: float,
+        *,
+        concept: str,
+    ) -> list[dict[str, object]]:
+        return [
+            *(annual(value, year, concept=concept)
+              for year, value in zip((2023, 2024, 2025), annual_values)),
+            q2(prior_q2, 2025, concept=concept),
+            q2(current_q2, 2026, concept=concept),
+        ]
+
+    facts = company_facts(
+        {
+            "NetCashProvidedByUsedInOperatingActivities": {
+                "USD": series(
+                    (12_000.0, 14_000.0, 16_000.0),
+                    7_000.0,
+                    8_500.0,
+                    concept="operating-cash-flow",
+                )
+            },
+            "PaymentsToAcquirePropertyPlantAndEquipment": {
+                "USD": series(
+                    (2_000.0, 2_500.0, 3_000.0),
+                    1_250.0,
+                    1_650.0,
+                    concept="capital-expenditure",
+                )
+            },
+            "ShareBasedCompensation": {
+                "USD": series(
+                    (500.0, 650.0, 800.0),
+                    350.0,
+                    450.0,
+                    concept="stock-compensation",
+                )
+            },
+            "AllocatedShareBasedCompensationExpense": {
+                "USD": [
+                    *(annual(value, year, concept="allocated-stock-compensation")
+                      for year, value in zip(
+                          (2023, 2024, 2025), (500.0, 650.0, 800.0)
+                      )),
+                    standalone_q2(
+                        350.0,
+                        2025,
+                        concept="allocated-stock-compensation",
+                    ),
+                    standalone_q2(
+                        450.0,
+                        2026,
+                        concept="allocated-stock-compensation",
+                    ),
+                ]
+            },
+            "InterestPaidNet": {
+                "USD": [
+                    annual(0.0, year, concept="interest-paid")
+                    for year in (2023, 2024, 2025)
+                ]
+            },
+            "Revenues": {
+                "USD": series(
+                    (60_000.0, 75_000.0, 90_000.0),
+                    40_000.0,
+                    48_000.0,
+                    concept="revenue",
+                )
+            },
+            "WeightedAverageNumberOfDilutedSharesOutstanding": {
+                "shares": series(
+                    (100.0, 100.0, 100.0),
+                    100.0,
+                    100.0,
+                    concept="diluted-shares",
+                )
+            },
+        }
+    )
+    install_fetch_payloads(monkeypatch, facts)
+
+    from app.services import sec_companyfacts
+
+    fundamentals = sec_companyfacts.fetch_sec_fundamentals("NASDAQ", "AAPL")
+    ttm = next(period for period in fundamentals.periods if period.is_ttm)
+
+    assert ttm.period_end.isoformat() == "2026-03-28"
+    assert ttm.operating_cash_flow == pytest.approx(17_500.0)
+    assert ttm.capital_expenditure == pytest.approx(3_400.0)
+    assert ttm.stock_based_compensation == pytest.approx(900.0)
+    assert ttm.revenue == pytest.approx(98_000.0)
+    assert ttm.interest_paid_outside_operating == 0.0
+    assert ttm.sources["operating_cash_flow"].accession == (
+        "operating-cash-flow-current-q2"
+    )
+
+    model_result = value_owner_earnings(fundamentals)
+    assert model_result.method == "owner_earnings_dcf"
+    assert model_result.quality["eligible"] is True
+
+
 def test_does_not_derive_ytd_ttm_without_prior_matching_quarter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
