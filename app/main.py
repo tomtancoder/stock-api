@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from app.api.v1.backtests import router as backtests_router
 from app.api.v1.intelligence import router as intelligence_router
 from app.api.v1.markets import router as markets_router
+from app.api.v1.screener import router as screener_router
 from app.api.v1.stocks import router as stocks_router
 
 app = FastAPI(
@@ -30,3 +31,4 @@ app.include_router(stocks_router, prefix="/api/v1")
 app.include_router(markets_router, prefix="/api/v1")
 app.include_router(backtests_router, prefix="/api/v1")
 app.include_router(intelligence_router, prefix="/api/v1")
+app.include_router(screener_router, prefix="/api/v1")

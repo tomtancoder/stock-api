@@ -474,6 +474,108 @@ def test_market_technical_endpoint_never_calls_valuation_service(monkeypatch):
     assert valuation_calls == []
 
 
+def test_market_breakout_analysis_endpoint_is_exchange_aware(monkeypatch):
+    from app.api.v1 import markets
+    from app.schemas import BreakoutAnalysisResponse, BreakoutSetupState, DataStatus
+
+    calls = []
+
+    def fake_breakout(exchange, symbol, benchmark_symbol, include_four_hour):
+        calls.append((exchange, symbol, benchmark_symbol, include_four_hour))
+        return BreakoutAnalysisResponse(
+            symbol=symbol,
+            exchange=exchange,
+            benchmark_symbol=benchmark_symbol or "SPY",
+            data_status=DataStatus.READY,
+            rating="Watchlist",
+            setup_state=BreakoutSetupState.PRE_BREAKOUT,
+            total_score=10,
+        )
+
+    monkeypatch.setattr(markets.breakout_service, "get_breakout_analysis", fake_breakout)
+    response = client.get(
+        "/api/v1/markets/SGX/D05/breakout-analysis",
+        params={"benchmark": "^STI", "include_four_hour": "true"},
+    )
+    assert response.status_code == 200
+    assert response.json()["exchange"] == "SGX"
+    assert calls == [("SGX", "D05", "^STI", True)]
+
+
+def test_market_breakout_analysis_translates_market_data_errors(monkeypatch):
+    from app.api.v1 import markets
+    from app.services.market_data import MarketDataError
+
+    monkeypatch.setattr(
+        markets.breakout_service,
+        "get_breakout_analysis",
+        lambda *args: (_ for _ in ()).throw(MarketDataError("provider unavailable")),
+    )
+    response = client.get("/api/v1/markets/NASDAQ/ACME/breakout-analysis")
+    assert response.status_code == 502
+    assert response.json()["detail"] == "provider unavailable"
+
+
+def test_openapi_documents_breakout_analysis_endpoint():
+    schema = client.get("/openapi.json").json()
+    assert "/api/v1/markets/{exchange}/{symbol}/breakout-analysis" in schema["paths"]
+
+
+def test_breakout_screener_endpoint_passes_validated_filters(monkeypatch):
+    from app.api.v1 import screener as screener_api
+    from app.schemas import BreakoutScreenerResponse
+
+    calls = []
+
+    def fake_scan(**kwargs):
+        calls.append(kwargs)
+        return BreakoutScreenerResponse(
+            market=kwargs["market"],
+            scanned_count=3,
+            eligible_count=1,
+            returned_count=1,
+        )
+
+    monkeypatch.setattr(screener_api.screener_service, "run_breakout_screener", fake_scan)
+    response = client.get(
+        "/api/v1/screener/breakouts",
+        params={
+            "market": "sg",
+            "minimum_score": 9,
+            "rating": "Watchlist",
+            "setup_state": "Pre-Breakout",
+            "maximum_extension_atr": 1.25,
+            "include_four_hour": "false",
+            "limit": 50,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["returned_count"] == 1
+    assert calls[0]["market"] == "sg"
+    assert calls[0]["minimum_score"] == 9
+    assert calls[0]["include_four_hour"] is False
+
+
+def test_breakout_screener_query_validation():
+    invalid_queries = [
+        {"minimum_score": -1},
+        {"minimum_score": 19},
+        {"limit": 0},
+        {"limit": 501},
+        {"maximum_extension_atr": -0.1},
+        {"market": "unknown"},
+        {"rating": "Unknown"},
+        {"setup_state": "Unknown"},
+    ]
+    for params in invalid_queries:
+        assert client.get("/api/v1/screener/breakouts", params=params).status_code == 422
+
+
+def test_openapi_documents_breakout_screener_endpoint():
+    schema = client.get("/openapi.json").json()
+    assert "/api/v1/screener/breakouts" in schema["paths"]
+
+
 def test_market_analysis_endpoint_returns_tradingview_analysis(monkeypatch):
     from app.api.v1 import markets
 

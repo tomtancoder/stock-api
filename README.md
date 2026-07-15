@@ -27,6 +27,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `GET /api/v1/markets/{exchange}/{symbol}/analysis?timeframe=1D`
 - `GET /api/v1/markets/{exchange}/{symbol}/valuation`
 - `GET /api/v1/markets/{exchange}/{symbol}/technical?timeframe=1D&include_multi_timeframe=false`
+- `GET /api/v1/markets/{exchange}/{symbol}/breakout-analysis?include_four_hour=false`
 - `GET /api/v1/markets/{exchange}/gainers`
 - `GET /api/v1/markets/{exchange}/losers`
 - `GET /api/v1/markets/{exchange}/bollinger-scan`
@@ -36,6 +37,7 @@ Open the API docs at `http://127.0.0.1:8000/docs`.
 - `POST /api/v1/backtests/{exchange}/{symbol}/walk-forward`
 - `GET /api/v1/sentiment/{symbol}`
 - `GET /api/v1/news`
+- `GET /api/v1/screener/breakouts`
 
 Legacy stock compatibility is limited to the quote and technical-analysis GET routes. New clients should use the canonical market `/quote` and `/technical` routes directly; the retained aliases are:
 
@@ -47,6 +49,7 @@ The legacy `GET /api/v1/stocks/{symbol}/fundamentals` and `POST /api/v1/stocks/{
 Quote responses are Yahoo-backed and include price, previous close, change, currency, market state, and 52-week high/low when Yahoo provides them.
 Analysis responses are calculated locally from yfinance OHLCV history, so `/analysis` does not call TradingView's scanner endpoint. Analysis `price_data` also includes yfinance fast quote metadata such as market cap and 52-week high/low when available. The top-level `valuation_metrics` object reports trailing P/E as the primary ratio, forward P/E separately, and their supporting EPS values. Missing trailing P/E is calculated from current price and positive diluted trailing EPS when possible; unavailable or non-positive inputs remain `null` without failing the analysis response.
 Technical responses come from TradingView MCP single-symbol technical analysis and include the provider's indicator objects, market sentiment, stock score when available, and trade setup fields when available. A cached TradingView scanner lookup also adds trailing P/E and 52-week high/low. These reference fields are nullable and do not make `/technical` depend on yFinance.
+Breakout analysis is a separate yFinance-backed daily setup model. It assigns an auditable 18-point Breakout Trend Confluence score, applies hard rating gates, and can add a separate 4H confirmation that never changes the daily score. The breakout score is technical and does not call the valuation endpoint or use intrinsic value. Valuation remains available as a separate research endpoint. See [docs/breakout-trend-confluence.md](docs/breakout-trend-confluence.md) for the scoring contract, examples, and frontend migration notes.
 Valuation responses use financial statements and a separately refreshed current quote. Ordinary operating companies use an owner-earnings DCF, banks use a residual-income model, and recognized REITs use a distribution-and-NAV model (or its documented distribution-only fallback).
 
 ## Markets
@@ -59,6 +62,7 @@ Exchange codes are mapped to Yahoo-compatible symbols where needed. For Singapor
 - Bank valuation: `GET /api/v1/markets/SGX/D05/valuation`
 - REIT valuation: `GET /api/v1/markets/SGX/C38U/valuation`
 - Technical: `GET /api/v1/markets/SGX/D05/technical?timeframe=1D`
+- Breakout analysis: `GET /api/v1/markets/SGX/D05/breakout-analysis?include_four_hour=true`
 
 The provider also accepts Yahoo-style Singapore symbols such as `S63.SI` for valuation and returns public symbols such as `SGX:S63`. The same normalization remains available to analysis and technical routes. Market-wide SGX scanners still depend on the symbol universe available from the TradingView MCP package.
 

@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     valuation_quote_ttl_seconds: int = Field(default=300, ge=1)
     valuation_stale_ttl_seconds: int = Field(default=604_800, ge=300)
     sec_user_agent: str | None = Field(default=None, min_length=3)
+    screener_cache_ttl_seconds: int = Field(default=3600, ge=1)
+    screener_batch_size: int = Field(default=75, ge=1, le=250)
+    maximum_market_data_age_days: int = Field(default=5, ge=1, le=30)
 
 
 @lru_cache

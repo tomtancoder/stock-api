@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from enum import Enum
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
@@ -18,6 +19,128 @@ class QuoteResponse(BaseModel):
     fifty_two_week_low: float | None = None
     source: str | None = None
     timestamp: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BreakoutSetupState(str, Enum):
+    PRE_BREAKOUT = "Pre-Breakout"
+    FRESH_BREAKOUT = "Fresh Breakout"
+    CONFIRMED_BREAKOUT = "Confirmed Breakout"
+    BREAKOUT_RETEST = "Breakout Retest"
+    TREND_TRANSITION = "Trend Transition"
+    FAILED_BREAKOUT = "Failed Breakout"
+    NO_VALID_SETUP = "No Valid Setup"
+
+
+class BreakoutRating(str, Enum):
+    STRONG_SETUP = "Strong Setup"
+    STARTER_SETUP = "Starter Setup"
+    WATCHLIST = "Watchlist"
+    AVOID = "Avoid"
+
+
+class DataStatus(str, Enum):
+    READY = "ready"
+    INSUFFICIENT_HISTORY = "insufficient_history"
+    STALE = "stale"
+    PARTIAL = "partial"
+    ERROR = "error"
+
+
+class FourHourStatus(str, Enum):
+    CONFIRMED = "4H Confirmed"
+    RETEST_HELD = "4H Retest Held"
+    WAIT = "Wait for 4H"
+    WEAK = "4H Weak"
+    UNAVAILABLE = "Unavailable"
+
+
+class BreakoutComponentScore(BaseModel):
+    score: int = Field(ge=0)
+    max_score: int = Field(ge=1)
+    flags: list[str] = Field(default_factory=list)
+    explanation: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def score_does_not_exceed_component_maximum(self) -> Self:
+        if self.score > self.max_score:
+            raise ValueError("score must not exceed max_score")
+        return self
+
+
+class BreakoutLevelInfo(BaseModel):
+    window: int | None = None
+    price: float | None = None
+    buffer: float | None = None
+    breakout_bars_ago: int | None = None
+    breakout_percent: float | None = None
+    close_location: float | None = None
+    base_depth_pct: float | None = None
+
+
+class BreakoutIndicatorSnapshot(BaseModel):
+    close: float | None = None
+    ema20: float | None = None
+    ema50: float | None = None
+    ema200: float | None = None
+    ema200_prior: float | None = None
+    rsi14: float | None = None
+    atr14: float | None = None
+    adx14: float | None = None
+    plus_di14: float | None = None
+    minus_di14: float | None = None
+    cmf20: float | None = None
+    volume_ratio: float | None = None
+    stock_return_63: float | None = None
+    benchmark_return_63: float | None = None
+
+
+class BreakoutRiskSnapshot(BaseModel):
+    invalidation_price: float | None = None
+    extension_atr: float | None = None
+    initial_risk_pct: float | None = None
+
+
+class BreakoutAnalysisResponse(BaseModel):
+    symbol: str
+    exchange: str
+    benchmark_symbol: str
+    as_of: str | None = None
+    data_status: DataStatus
+    rating: BreakoutRating | None = None
+    setup_state: BreakoutSetupState
+    total_score: int | None = Field(default=None, ge=0, le=18)
+    four_hour_status: FourHourStatus = FourHourStatus.UNAVAILABLE
+    breakout: BreakoutComponentScore | None = None
+    trend: BreakoutComponentScore | None = None
+    volume: BreakoutComponentScore | None = None
+    momentum: BreakoutComponentScore | None = None
+    relative_strength: BreakoutComponentScore | None = None
+    entry_quality: BreakoutComponentScore | None = None
+    level: BreakoutLevelInfo | None = None
+    indicators: BreakoutIndicatorSnapshot | None = None
+    risk: BreakoutRiskSnapshot | None = None
+    flags: list[str] = Field(default_factory=list)
+    explanation: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BreakoutScreenerError(BaseModel):
+    symbol: str
+    error_type: str
+    message: str
+
+
+class BreakoutScreenerResponse(BaseModel):
+    as_of: str | None = None
+    market: str
+    benchmark_symbols: list[str] = Field(default_factory=list)
+    scanned_count: int = Field(ge=0)
+    eligible_count: int = Field(ge=0)
+    excluded_low_liquidity_count: int = Field(default=0, ge=0)
+    returned_count: int = Field(ge=0)
+    results: list[BreakoutAnalysisResponse] = Field(default_factory=list)
+    errors: list[BreakoutScreenerError] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
