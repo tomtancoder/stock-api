@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from app.services.market_symbols import to_yahoo_symbol
 from app.services.yfinance_analysis import get_analysis as get_yfinance_analysis
+from app.services.yfinance_fundamentals import get_company_name, get_valuation_metadata
 
 
 class TradingViewProviderError(RuntimeError):
@@ -115,6 +116,9 @@ def get_quote(exchange: str, symbol: str) -> dict[str, Any]:
     return {
         "symbol": payload.get("symbol", _normalize_symbol(symbol)),
         "exchange": _normalize_exchange(exchange),
+        "name": get_company_name(
+            get_valuation_metadata(to_yahoo_symbol(exchange, symbol))
+        ),
         "price": payload.get("price"),
         "previous_close": payload.get("previous_close"),
         "change": payload.get("change"),

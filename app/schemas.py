@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 class QuoteResponse(BaseModel):
     symbol: str
     exchange: str
+    name: str | None = None
     price: float | None = None
     previous_close: float | None = None
     change: float | None = None

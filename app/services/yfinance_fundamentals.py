@@ -14,6 +14,13 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _CACHE_LOCK = Lock()
 
 
+def get_company_name(metadata: dict[str, Any] | None) -> str | None:
+    for value in ((metadata or {}).get("short_name"), (metadata or {}).get("long_name")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def get_valuation_metadata(symbol: str) -> dict[str, Any]:
     normalized_symbol = symbol.strip().upper()
     now = monotonic()
@@ -55,6 +62,8 @@ def _download_valuation_metadata(symbol: str) -> dict[str, Any]:
             diluted_eps_ttm = None
 
     return {
+        "short_name": info.get("shortName"),
+        "long_name": info.get("longName"),
         "trailing_pe": info.get("trailingPE"),
         "forward_pe": info.get("forwardPE"),
         "diluted_eps_ttm": diluted_eps_ttm,

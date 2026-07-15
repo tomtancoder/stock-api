@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from app.services import yfinance_fundamentals
-from app.services.yfinance_fundamentals import build_valuation_metrics
+from app.services.yfinance_fundamentals import build_valuation_metrics, get_company_name
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +37,19 @@ def test_build_valuation_metrics_prefers_direct_ratios():
         "primary_pe": "trailing",
         "pe_calculated": False,
     }
+
+
+def test_get_company_name_prefers_short_name_and_ignores_blank_values():
+    assert get_company_name(
+        {
+            "short_name": "Vanguard Health Care ETF",
+            "long_name": "Vanguard Health Care Index Fund ETF Shares",
+        }
+    ) == "Vanguard Health Care ETF"
+    assert get_company_name(
+        {"short_name": "  ", "long_name": "  Apple Inc.  "}
+    ) == "Apple Inc."
+    assert get_company_name({"short_name": "", "long_name": ""}) is None
 
 
 def test_build_valuation_metrics_calculates_missing_ratios():
@@ -87,6 +100,8 @@ def test_get_valuation_metadata_uses_statement_diluted_eps_fallback(monkeypatch)
 
         def get_info(self):
             return {
+                "shortName": "Microsoft",
+                "longName": "Microsoft Corporation",
                 "trailingPE": None,
                 "forwardPE": 18,
                 "trailingEps": None,
@@ -102,6 +117,8 @@ def test_get_valuation_metadata_uses_statement_diluted_eps_fallback(monkeypatch)
     result = yfinance_fundamentals.get_valuation_metadata("msft")
 
     assert result == {
+        "short_name": "Microsoft",
+        "long_name": "Microsoft Corporation",
         "trailing_pe": None,
         "forward_pe": 18,
         "diluted_eps_ttm": 4.0,

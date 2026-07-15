@@ -419,6 +419,14 @@ def test_quote_maps_yahoo_price_payload(monkeypatch):
 
     monkeypatch.setattr(
         provider,
+        "get_valuation_metadata",
+        lambda symbol: {
+            "short_name": "Tesla, Inc.",
+            "long_name": "Tesla Motors",
+        },
+    )
+    monkeypatch.setattr(
+        provider,
         "get_price",
         lambda symbol: {
             "symbol": "TSLA",
@@ -441,6 +449,7 @@ def test_quote_maps_yahoo_price_payload(monkeypatch):
     assert response == {
         "symbol": "TSLA",
         "exchange": "NASDAQ",
+        "name": "Tesla, Inc.",
         "price": 428.11,
         "previous_close": 423.19,
         "change": 4.92,

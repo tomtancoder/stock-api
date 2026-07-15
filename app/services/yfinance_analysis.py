@@ -8,6 +8,7 @@ import pandas as pd
 from app.services.market_symbols import to_public_symbol, to_yahoo_symbol
 from app.services.yfinance_fundamentals import (
     build_valuation_metrics,
+    get_company_name,
     get_valuation_metadata,
 )
 
@@ -146,6 +147,7 @@ def _build_analysis(
     return {
         "symbol": to_public_symbol(exchange, original_symbol),
         "exchange": exchange.strip().upper(),
+        "name": get_company_name(valuation_metadata),
         "timeframe": timeframe,
         "source": "yfinance",
         "timestamp": _latest_timestamp(history),
